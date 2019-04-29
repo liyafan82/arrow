@@ -166,7 +166,7 @@ public abstract class SqlPerformancefTestBase {
             "Num of repeats = " + numRepeats + "\n" +
             "Max duration = " + maxDuration + "ms\n" +
             "Min duration = " + minDuration + "ms\n" +
-            "Avg duration = " + totalDuration / numRepeats + "ms");
+            "Avg duration = " + totalDuration / numRepeats + "ms\n");
   }
 
   // /UTILITY METHODS FROM HERE
