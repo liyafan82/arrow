@@ -48,7 +48,17 @@ public class SearchTreeBasedDictionaryBuilder<V extends ValueVector> extends Dic
    * @param comparator the criteria for value equality.
    */
   public SearchTreeBasedDictionaryBuilder(V dictionary, VectorValueComparator<V> comparator) {
-    super(dictionary, comparator);
+    this(dictionary, comparator, false);
+  }
+
+  /**
+   * Construct a search tree-based dictionary builder.
+   * @param dictionary the dictionary vector.
+   * @param comparator the criteria for value equality.
+   * @param encodeNull if null should be encoded.
+   */
+  public SearchTreeBasedDictionaryBuilder(V dictionary, VectorValueComparator<V> comparator, boolean encodeNull) {
+    super(dictionary, comparator, encodeNull);
 
     if (dictionary instanceof BaseFixedWidthVector) {
       fixedWidthVector = (BaseFixedWidthVector) dictionary;

@@ -44,13 +44,29 @@ public abstract class DictionaryBuilder<V extends ValueVector> {
   protected int distinctValueCount;
 
   /**
+   * If null should be encoded.
+   */
+  protected final boolean encodeNull;
+
+  /**
    * Construct a dictionary builder.
    * @param dictionary the dictionary vector.
    * @param comparator the criteria for value equality.
    */
   public DictionaryBuilder(V dictionary, VectorValueComparator<V> comparator) {
+    this(dictionary, comparator, false);
+  }
+
+  /**
+   * Construct a dictionary builder.
+   * @param dictionary the dictionary vector.
+   * @param comparator the criteria for value equality.
+   * @param encodeNull if null should be encoded.
+   */
+  public DictionaryBuilder(V dictionary, VectorValueComparator<V> comparator, boolean encodeNull) {
     this.dictionary = dictionary;
     this.comparator = comparator;
+    this.encodeNull = encodeNull;
     this.comparator.attachVector(dictionary);
   }
 
@@ -75,6 +91,9 @@ public abstract class DictionaryBuilder<V extends ValueVector> {
   public int addValues(V targetVector) {
     int ret = 0;
     for (int i = 0; i < targetVector.getValueCount(); i++) {
+      if (!encodeNull && targetVector.isNull(i)) {
+        continue;
+      }
       if (addValue(targetVector, i)) {
         ret += 1;
       }

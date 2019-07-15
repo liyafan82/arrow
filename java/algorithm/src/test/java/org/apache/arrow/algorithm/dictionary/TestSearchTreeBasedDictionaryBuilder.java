@@ -20,6 +20,9 @@ package org.apache.arrow.algorithm.dictionary;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import java.util.Arrays;
+import java.util.Collection;
+
 import org.apache.arrow.algorithm.sort.DefaultVectorComparators;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -28,13 +31,22 @@ import org.apache.arrow.vector.VarCharVector;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 /**
  * Test cases for {@link SearchTreeBasedDictionaryBuilder}.
  */
+@RunWith(Parameterized.class)
 public class TestSearchTreeBasedDictionaryBuilder {
 
+  private boolean encodeNull;
+
   private BufferAllocator allocator;
+
+  public TestSearchTreeBasedDictionaryBuilder(boolean encodeNull) {
+    this.encodeNull = encodeNull;
+  }
 
   @Before
   public void prepare() {
@@ -71,24 +83,38 @@ public class TestSearchTreeBasedDictionaryBuilder {
 
       DefaultVectorComparators.VarCharComparator comparator = new DefaultVectorComparators.VarCharComparator();
       SearchTreeBasedDictionaryBuilder<VarCharVector> dictionaryBuilder =
-              new SearchTreeBasedDictionaryBuilder<>(dictionary, comparator);
+              new SearchTreeBasedDictionaryBuilder<>(dictionary, comparator, encodeNull);
 
       dictionaryBuilder.startBuild();
       int result = dictionaryBuilder.addValues(vec);
       dictionaryBuilder.endBuild();
 
-      assertEquals(7, result);
-      assertEquals(7, dictionary.getValueCount());
+      if (encodeNull) {
+        assertEquals(7, result);
+        assertEquals(7, dictionary.getValueCount());
 
-      dictionaryBuilder.getSortedDictionary(sortedDictionary);
+        dictionaryBuilder.getSortedDictionary(sortedDictionary);
 
-      assertTrue(sortedDictionary.isNull(0));
-      assertEquals("12", new String(sortedDictionary.get(1)));
-      assertEquals("abc", new String(sortedDictionary.get(2)));
-      assertEquals("dictionary", new String(sortedDictionary.get(3)));
-      assertEquals("good", new String(sortedDictionary.get(4)));
-      assertEquals("hello", new String(sortedDictionary.get(5)));
-      assertEquals("world", new String(sortedDictionary.get(6)));
+        assertTrue(sortedDictionary.isNull(0));
+        assertEquals("12", new String(sortedDictionary.get(1)));
+        assertEquals("abc", new String(sortedDictionary.get(2)));
+        assertEquals("dictionary", new String(sortedDictionary.get(3)));
+        assertEquals("good", new String(sortedDictionary.get(4)));
+        assertEquals("hello", new String(sortedDictionary.get(5)));
+        assertEquals("world", new String(sortedDictionary.get(6)));
+      } else {
+        assertEquals(6, result);
+        assertEquals(6, dictionary.getValueCount());
+
+        dictionaryBuilder.getSortedDictionary(sortedDictionary);
+
+        assertEquals("12", new String(sortedDictionary.get(0)));
+        assertEquals("abc", new String(sortedDictionary.get(1)));
+        assertEquals("dictionary", new String(sortedDictionary.get(2)));
+        assertEquals("good", new String(sortedDictionary.get(3)));
+        assertEquals("hello", new String(sortedDictionary.get(4)));
+        assertEquals("world", new String(sortedDictionary.get(5)));
+      }
     }
   }
 
@@ -117,22 +143,39 @@ public class TestSearchTreeBasedDictionaryBuilder {
 
       DefaultVectorComparators.IntComparator comparator = new DefaultVectorComparators.IntComparator();
       SearchTreeBasedDictionaryBuilder<IntVector> dictionaryBuilder =
-              new SearchTreeBasedDictionaryBuilder<>(dictionary, comparator);
+              new SearchTreeBasedDictionaryBuilder<>(dictionary, comparator, encodeNull);
 
       dictionaryBuilder.startBuild();
       int result = dictionaryBuilder.addValues(vec);
       dictionaryBuilder.endBuild();
 
-      assertEquals(5, result);
-      assertEquals(5, dictionary.getValueCount());
+      if (encodeNull) {
+        assertEquals(5, result);
+        assertEquals(5, dictionary.getValueCount());
 
-      dictionaryBuilder.getSortedDictionary(sortedDictionary);
+        dictionaryBuilder.getSortedDictionary(sortedDictionary);
 
-      assertTrue(sortedDictionary.isNull(0));
-      assertEquals(4, sortedDictionary.get(1));
-      assertEquals(8, sortedDictionary.get(2));
-      assertEquals(16, sortedDictionary.get(3));
-      assertEquals(32, sortedDictionary.get(4));
+        assertTrue(sortedDictionary.isNull(0));
+        assertEquals(4, sortedDictionary.get(1));
+        assertEquals(8, sortedDictionary.get(2));
+        assertEquals(16, sortedDictionary.get(3));
+        assertEquals(32, sortedDictionary.get(4));
+      } else {
+        assertEquals(4, result);
+        assertEquals(4, dictionary.getValueCount());
+
+        dictionaryBuilder.getSortedDictionary(sortedDictionary);
+
+        assertEquals(4, sortedDictionary.get(0));
+        assertEquals(8, sortedDictionary.get(1));
+        assertEquals(16, sortedDictionary.get(2));
+        assertEquals(32, sortedDictionary.get(3));
+      }
     }
+  }
+
+  @Parameterized.Parameters(name = "encode null = {0}")
+  public static Collection<Object[]> getParameters() {
+    return Arrays.asList(new Object[][] { { true }, { false }});
   }
 }
