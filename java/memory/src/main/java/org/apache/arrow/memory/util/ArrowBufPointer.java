@@ -18,6 +18,8 @@
 package org.apache.arrow.memory.util;
 
 import io.netty.buffer.ArrowBuf;
+import org.apache.arrow.memory.util.hash.ArrowBufHasher;
+import org.apache.arrow.memory.util.hash.DirectHasher;
 
 /**
  * Pointer to a memory region within an {@link io.netty.buffer.ArrowBuf}.
@@ -30,6 +32,15 @@ public final class ArrowBufPointer {
   private int offset;
 
   private int length;
+
+  private int hashCode = 0;
+
+  private ArrowBufHasher hasher;
+
+  /**
+   * A flag indicating if the underlying memory region has changed..
+   */
+  private boolean dirty = false;
 
   /**
    * The default constructor.
@@ -58,6 +69,12 @@ public final class ArrowBufPointer {
     this.buf = buf;
     this.offset = offset;
     this.length = length;
+
+    dirty = true;
+  }
+
+  public void setHasher(ArrowBufHasher hasher) {
+    this.hasher = hasher;
   }
 
   /**
@@ -100,7 +117,21 @@ public final class ArrowBufPointer {
 
   @Override
   public int hashCode() {
-    // implement after ARROW-5898
-    throw new UnsupportedOperationException();
+    if (!dirty) {
+      return hashCode;
+    }
+
+    // re-compute the hash code
+    if (buf == null) {
+      hashCode = 0;
+    } else {
+      if (hasher == null) {
+        hasher = DirectHasher.INSTANCE;
+      }
+      hashCode = hasher.hashCode(buf, offset, length);
+    }
+
+    dirty = false;
+    return hashCode;
   }
 }

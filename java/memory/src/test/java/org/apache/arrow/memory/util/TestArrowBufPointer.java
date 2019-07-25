@@ -17,12 +17,13 @@
 
 package org.apache.arrow.memory.util;
 
+import static junit.framework.TestCase.assertEquals;
 import static junit.framework.TestCase.assertTrue;
-
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 
+import org.apache.arrow.memory.util.hash.DirectHasher;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -64,6 +65,31 @@ public class TestArrowBufPointer {
         ptr1.set(buf1, i * 4, 4);
         ptr2.set(buf2, i * 4, 4);
         assertTrue(ptr1.equals(ptr2));
+      }
+    }
+  }
+
+  @Test
+  public void testArrowBufPointersHashCode() {
+    final int vectorLength = 100;
+    try (ArrowBuf buf1 = allocator.buffer(vectorLength * 4);
+         ArrowBuf buf2 = allocator.buffer(vectorLength * 4)) {
+      for (int i = 0; i < vectorLength; i++) {
+        buf1.setInt(i * 4, i);
+        buf2.setInt(i * 4, i);
+      }
+
+      ArrowBufPointer pointer1 = new ArrowBufPointer();
+      assertEquals(0, pointer1.hashCode());
+
+      ArrowBufPointer pointer2 = new ArrowBufPointer();
+      assertEquals(0, pointer2.hashCode());
+
+      for (int i = 0; i < vectorLength; i++) {
+        pointer1.set(buf1, i * 4, 4);
+        pointer2.set(buf2, i * 4, 4);
+
+        assertEquals(pointer1.hashCode(), pointer2.hashCode());
       }
     }
   }
