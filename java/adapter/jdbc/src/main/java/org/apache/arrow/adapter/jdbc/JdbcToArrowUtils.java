@@ -62,17 +62,6 @@ import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
-import org.apache.arrow.vector.holders.NullableBigIntHolder;
-import org.apache.arrow.vector.holders.NullableBitHolder;
-import org.apache.arrow.vector.holders.NullableDateMilliHolder;
-import org.apache.arrow.vector.holders.NullableDecimalHolder;
-import org.apache.arrow.vector.holders.NullableFloat4Holder;
-import org.apache.arrow.vector.holders.NullableFloat8Holder;
-import org.apache.arrow.vector.holders.NullableIntHolder;
-import org.apache.arrow.vector.holders.NullableSmallIntHolder;
-import org.apache.arrow.vector.holders.NullableTimeMilliHolder;
-import org.apache.arrow.vector.holders.NullableTinyIntHolder;
-import org.apache.arrow.vector.holders.NullableVarCharHolder;
 import org.apache.arrow.vector.holders.VarBinaryHolder;
 import org.apache.arrow.vector.holders.VarCharHolder;
 import org.apache.arrow.vector.types.DateUnit;
@@ -81,7 +70,6 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.arrow.vector.util.DecimalUtility;
 
 import io.netty.buffer.ArrowBuf;
 
@@ -493,123 +481,74 @@ public class JdbcToArrowUtils {
   }
 
   private static void updateVector(BitVector bitVector, boolean value, boolean isNonNull, int rowCount) {
-    NullableBitHolder holder = new NullableBitHolder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull) {
-      holder.value = value ? 1 : 0;
-    }
-    bitVector.setSafe(rowCount, holder);
+    bitVector.setSafe(rowCount, isNonNull ? 1 : 0, value ? 1 : 0);
     bitVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(TinyIntVector tinyIntVector, int value, boolean isNonNull, int rowCount) {
-    NullableTinyIntHolder holder = new NullableTinyIntHolder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull) {
-      holder.value = (byte) value;
-    }
-    tinyIntVector.setSafe(rowCount, holder);
+    tinyIntVector.setSafe(rowCount, isNonNull ? 1 : 0, (byte) value);
     tinyIntVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(SmallIntVector smallIntVector, int value, boolean isNonNull, int rowCount) {
-    NullableSmallIntHolder holder = new NullableSmallIntHolder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull) {
-      holder.value = (short) value;
-    }
-    smallIntVector.setSafe(rowCount, holder);
+    smallIntVector.setSafe(rowCount, isNonNull ? 1 : 0, (short) value);
     smallIntVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(IntVector intVector, int value, boolean isNonNull, int rowCount) {
-    NullableIntHolder holder = new NullableIntHolder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull) {
-      holder.value = value;
-    }
-    intVector.setSafe(rowCount, holder);
+    intVector.setSafe(rowCount, isNonNull ? 1 : 0, value);
     intVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(BigIntVector bigIntVector, long value, boolean isNonNull, int rowCount) {
-    NullableBigIntHolder holder = new NullableBigIntHolder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull) {
-      holder.value = value;
-    }
-    bigIntVector.setSafe(rowCount, holder);
+    bigIntVector.setSafe(rowCount, isNonNull ? 1 : 0, value);
     bigIntVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(DecimalVector decimalVector, BigDecimal value, boolean isNonNull, int rowCount) {
-    NullableDecimalHolder holder = new NullableDecimalHolder();
-    holder.isSet = isNonNull ? 1 : 0;
     if (isNonNull) {
-      holder.precision = value.precision();
-      holder.scale = value.scale();
-      holder.buffer = decimalVector.getAllocator().buffer(DEFAULT_BUFFER_SIZE);
-      holder.start = 0;
-      DecimalUtility.writeBigDecimalToArrowBuf(value, holder.buffer, holder.start);
+      decimalVector.set(rowCount, value);
+    } else {
+      decimalVector.setNull(rowCount);
     }
-    decimalVector.setSafe(rowCount, holder);
     decimalVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(Float4Vector float4Vector, float value, boolean isNonNull, int rowCount) {
-    NullableFloat4Holder holder = new NullableFloat4Holder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull) {
-      holder.value = value;
-    }
-    float4Vector.setSafe(rowCount, holder);
+    float4Vector.setSafe(rowCount, isNonNull ? 1 : 0, value);
     float4Vector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(Float8Vector float8Vector, double value, boolean isNonNull, int rowCount) {
-    NullableFloat8Holder holder = new NullableFloat8Holder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull) {
-      holder.value = value;
-    }
-    float8Vector.setSafe(rowCount, holder);
+    float8Vector.setSafe(rowCount, isNonNull ? 1 : 0, value);
     float8Vector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(VarCharVector varcharVector, String value, boolean isNonNull, int rowCount) {
-    NullableVarCharHolder holder = new NullableVarCharHolder();
-    holder.isSet = isNonNull ? 1 : 0;
     varcharVector.setIndexDefined(rowCount);
     if (isNonNull) {
-      byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-      holder.buffer = varcharVector.getAllocator().buffer(bytes.length);
-      holder.buffer.setBytes(0, bytes, 0, bytes.length);
-      holder.start = 0;
-      holder.end = bytes.length;
+      varcharVector.setSafe(rowCount, value.getBytes());
     } else {
-      holder.buffer = varcharVector.getAllocator().buffer(0);
+      varcharVector.setNull(rowCount);
     }
-    varcharVector.setSafe(rowCount, holder);
     varcharVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(DateMilliVector dateMilliVector, Date date, boolean isNonNull, int rowCount) {
-    NullableDateMilliHolder holder = new NullableDateMilliHolder();
-    holder.isSet = isNonNull ? 1 : 0;
     if (isNonNull) {
-      holder.value = date.getTime();
+      dateMilliVector.setSafe(rowCount, isNonNull ? 1 : 0, date.getTime());
+    } else {
+      dateMilliVector.setNull(rowCount);
     }
-    dateMilliVector.setSafe(rowCount, holder);
     dateMilliVector.setValueCount(rowCount + 1);
   }
 
   private static void updateVector(TimeMilliVector timeMilliVector, Time time, boolean isNonNull, int rowCount) {
-    NullableTimeMilliHolder holder = new NullableTimeMilliHolder();
-    holder.isSet = isNonNull ? 1 : 0;
-    if (isNonNull && time != null) {
-      holder.value = (int) time.getTime();
+    if (isNonNull) {
+      timeMilliVector.setSafe(rowCount, isNonNull ? 1 : 0, (int) time.getTime());
+    } else {
+      timeMilliVector.setNull(rowCount);
     }
-    timeMilliVector.setSafe(rowCount, holder);
     timeMilliVector.setValueCount(rowCount + 1);
   }
 
