@@ -39,7 +39,7 @@ class ARROW_DS_EXPORT DataFragment {
   /// \brief Scan returns an iterator of ScanTasks, each of which yields
   /// RecordBatches from this DataFragment.
   virtual Status Scan(std::shared_ptr<ScanContext> scan_context,
-                      std::unique_ptr<ScanTaskIterator>* out) = 0;
+                      ScanTaskIterator* out) = 0;
 
   /// \brief Return true if the fragment can benefit from parallel
   /// scanning
@@ -60,8 +60,7 @@ class ARROW_DS_EXPORT SimpleDataFragment : public DataFragment {
  public:
   explicit SimpleDataFragment(std::vector<std::shared_ptr<RecordBatch>> record_batches);
 
-  Status Scan(std::shared_ptr<ScanContext> scan_context,
-              std::unique_ptr<ScanTaskIterator>* out) override;
+  Status Scan(std::shared_ptr<ScanContext> scan_context, ScanTaskIterator* out) override;
 
   bool splittable() const override { return false; }
 
@@ -78,8 +77,7 @@ class ARROW_DS_EXPORT DataSource {
  public:
   /// \brief GetFragments returns an iterator of DataFragments. The ScanOptions
   /// controls filtering and schema inference.
-  virtual std::unique_ptr<DataFragmentIterator> GetFragments(
-      std::shared_ptr<ScanOptions> options) = 0;
+  virtual DataFragmentIterator GetFragments(std::shared_ptr<ScanOptions> options) = 0;
 
   virtual std::string type() const = 0;
 
@@ -92,8 +90,7 @@ class ARROW_DS_EXPORT SimpleDataSource : public DataSource {
   explicit SimpleDataSource(DataFragmentVector fragments)
       : fragments_(std::move(fragments)) {}
 
-  std::unique_ptr<DataFragmentIterator> GetFragments(
-      std::shared_ptr<ScanOptions> options) override {
+  DataFragmentIterator GetFragments(std::shared_ptr<ScanOptions> options) override {
     return MakeVectorIterator(fragments_);
   }
 
@@ -107,30 +104,23 @@ class ARROW_DS_EXPORT SimpleDataSource : public DataSource {
 /// from possibly multiple sources.
 class ARROW_DS_EXPORT Dataset : public std::enable_shared_from_this<Dataset> {
  public:
-  /// \param[in] source a single input data source
-  /// \param[in] schema a known schema to conform to, may be nullptr
-  explicit Dataset(std::shared_ptr<DataSource> source,
-                   std::shared_ptr<Schema> schema = NULLPTR);
-
+  /// WARNING, this constructor is not recommend, use Dataset::Make instead.
   /// \param[in] sources one or more input data sources
   /// \param[in] schema a known schema to conform to, may be nullptr
   explicit Dataset(const std::vector<std::shared_ptr<DataSource>>& sources,
-                   std::shared_ptr<Schema> schema = NULLPTR);
+                   const std::shared_ptr<Schema>& schema)
+      : schema_(schema), sources_(sources) {}
 
-  virtual ~Dataset() = default;
+  static Status Make(const std::vector<std::shared_ptr<DataSource>>& sources,
+                     const std::shared_ptr<Schema>& schema,
+                     std::shared_ptr<Dataset>* out);
 
   /// \brief Begin to build a new Scan operation against this Dataset
-  ScannerBuilder NewScan() const;
+  Status NewScan(std::unique_ptr<ScannerBuilder>* out);
 
   const std::vector<std::shared_ptr<DataSource>>& sources() const { return sources_; }
 
   std::shared_ptr<Schema> schema() const { return schema_; }
-
-  /// \brief Compute consensus schema from input data sources
-  Status InferSchema(std::shared_ptr<Schema>* out);
-
-  /// \brief Return a copy of Dataset with a new target schema
-  Status ReplaceSchema(std::shared_ptr<Schema> schema, std::unique_ptr<Dataset>* out);
 
  protected:
   // The data sources must conform their output to this schema (with

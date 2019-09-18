@@ -217,6 +217,21 @@ def test_no_memory_map(tempdir):
     assert table_read.equals(table)
 
 
+@pytest.mark.pandas
+def test_enable_buffered_stream(tempdir):
+    df = alltypes_sample(size=10)
+
+    table = pa.Table.from_pandas(df)
+    _check_roundtrip(table, read_table_kwargs={'buffer_size': 1025},
+                     version='2.0')
+
+    filename = str(tempdir / 'tmp_file')
+    with open(filename, 'wb') as f:
+        _write_table(table, f, version='2.0')
+    table_read = pq.read_pandas(filename, buffer_size=4096)
+    assert table_read.equals(table)
+
+
 def test_special_chars_filename(tempdir):
     table = pa.Table.from_arrays([pa.array([42])], ["ints"])
     filename = "foo # bar"
@@ -255,6 +270,17 @@ def test_empty_lists_table_roundtrip():
     arr = pa.array([[], []], type=pa.list_(pa.int32()))
     table = pa.Table.from_arrays([arr], ["A"])
     _check_roundtrip(table)
+
+
+def test_nested_list_nonnullable_roundtrip_bug():
+    # Reproduce failure in ARROW-5630
+    typ = pa.list_(pa.field("item", pa.float32(), False))
+    num_rows = 10000
+    t = pa.table([
+        pa.array(([[0] * ((i + 5) % 10) for i in range(0, 10)]
+                  * (num_rows // 10)), type=typ)
+    ], ['a'])
+    _check_roundtrip(t, data_page_size=4096)
 
 
 @pytest.mark.pandas
@@ -2096,6 +2122,24 @@ def test_dataset_no_memory_map(tempdir):
 
 
 @pytest.mark.pandas
+def test_dataset_enable_buffered_stream(tempdir):
+    dirpath = tempdir / guid()
+    dirpath.mkdir()
+
+    df = _test_dataframe(10, seed=0)
+    path = dirpath / '{}.parquet'.format(0)
+    table = pa.Table.from_pandas(df)
+    _write_table(table, path, version='2.0')
+
+    with pytest.raises(ValueError):
+        pq.ParquetDataset(dirpath, buffer_size=-64)
+
+    for buffer_size in [128, 1024]:
+        dataset = pq.ParquetDataset(dirpath, buffer_size=buffer_size)
+        assert dataset.pieces[0].read().equals(table)
+
+
+@pytest.mark.pandas
 @pytest.mark.parametrize('preserve_index', [True, False, None])
 def test_dataset_read_pandas_common_metadata(tempdir, preserve_index):
     # ARROW-1103
@@ -2445,11 +2489,29 @@ def test_large_table_int32_overflow():
     _write_table(table, f)
 
 
-def _simple_table_roundtrip(table):
+def _simple_table_roundtrip(table, **write_kwargs):
     stream = pa.BufferOutputStream()
-    _write_table(table, stream)
+    _write_table(table, stream, **write_kwargs)
     buf = stream.getvalue()
     return _read_table(buf)
+
+
+@pytest.mark.large_memory
+def test_byte_array_exactly_2gb():
+    # Test edge case reported in ARROW-3762
+    val = b'x' * (1 << 10)
+
+    base = pa.array([val] * ((1 << 21) - 1))
+    cases = [
+        [b'x' * 1023],  # 2^31 - 1
+        [b'x' * 1024],  # 2^31
+        [b'x' * 1025]   # 2^31 + 1
+    ]
+    for case in cases:
+        values = pa.chunked_array([base, pa.array(case)])
+        t = pa.table([values], names=['f0'])
+        result = _simple_table_roundtrip(t, use_dictionary=False)
+        assert t.equals(result)
 
 
 @pytest.mark.pandas

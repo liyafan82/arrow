@@ -23,7 +23,7 @@ arrow_install_all_headers("arrow/dataset")
 # pkg-config support
 arrow_add_pkg_config("arrow-dataset")
 
-set(ARROW_DATASET_SRCS dataset.cc file_base.cc scanner.cc)
+set(ARROW_DATASET_SRCS dataset.cc file_base.cc filter.cc scanner.cc)
 set(ARROW_DATASET_LINK_STATIC arrow_static)
 set(ARROW_DATASET_LINK_SHARED arrow_shared)
 
@@ -56,31 +56,46 @@ foreach(LIB_TARGET ${ARROW_DATASET_LIBRARIES})
   target_compile_definitions(${LIB_TARGET} PRIVATE ARROW_DS_EXPORTING)
 endforeach()
 
-if(NOT WIN32)
-  add_arrow_test(dataset_test
-                 EXTRA_LINK_LIBS
-                 ${ARROW_DATASET_TEST_LINK_LIBS}
-                 PREFIX
-                 "arrow-dataset"
-                 LABELS
-                 "arrow_dataset")
+# Adding unit tests part of the "dataset" portion of the test suite
+function(ADD_ARROW_DATASET_TEST REL_TEST_NAME)
+  set(options)
+  set(one_value_args PREFIX)
+  set(multi_value_args LABELS)
+  cmake_parse_arguments(ARG
+                        "${options}"
+                        "${one_value_args}"
+                        "${multi_value_args}"
+                        ${ARGN})
 
-  add_arrow_test(file_test
+  if(ARG_PREFIX)
+    set(PREFIX ${ARG_PREFIX})
+  else()
+    set(PREFIX "arrow-dataset")
+  endif()
+
+  if(ARG_LABELS)
+    set(LABELS ${ARG_LABELS})
+  else()
+    set(LABELS "arrow_dataset")
+  endif()
+
+  add_arrow_test(${REL_TEST_NAME}
                  EXTRA_LINK_LIBS
                  ${ARROW_DATASET_TEST_LINK_LIBS}
                  PREFIX
-                 "arrow-dataset"
+                 ${PREFIX}
                  LABELS
-                 "arrow_dataset")
+                 ${LABELS}
+                 ${ARG_UNPARSED_ARGUMENTS})
+endfunction()
+
+if(NOT WIN32)
+  add_arrow_dataset_test(dataset_test)
+  add_arrow_dataset_test(file_test)
+  add_arrow_dataset_test(filter_test)
+  add_arrow_dataset_test(scanner_test)
 
   if(ARROW_PARQUET)
-    add_arrow_test(file_parquet_test
-                   EXTRA_LINK_LIBS
-                   ${ARROW_DATASET_TEST_LINK_LIBS}
-                   PREFIX
-                   "arrow-dataset"
-                   LABELS
-                   "arrow_dataset")
-
+    add_arrow_dataset_test(file_parquet_test)
   endif()
 endif()

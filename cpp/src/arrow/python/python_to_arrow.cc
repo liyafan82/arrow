@@ -38,13 +38,13 @@
 #include "arrow/util/decimal.h"
 #include "arrow/util/logging.h"
 
+#include "arrow/python/datetime.h"
 #include "arrow/python/decimal.h"
 #include "arrow/python/helpers.h"
 #include "arrow/python/inference.h"
 #include "arrow/python/iterators.h"
 #include "arrow/python/numpy_convert.h"
 #include "arrow/python/type_traits.h"
-#include "arrow/python/util/datetime.h"
 
 namespace arrow {
 
@@ -94,12 +94,12 @@ class SeqConverter {
     return Status::OK();
   }
 
-  virtual Status GetResult(std::vector<std::shared_ptr<Array>>* chunks) {
+  virtual Status GetResult(std::shared_ptr<ChunkedArray>* out) {
     // Still some accumulated data in the builder. If there are no chunks, we
     // always call Finish to deal with the edge case where a size-0 sequence
     // was converted with a specific output type, like array([], type=t)
     RETURN_NOT_OK(Close());
-    *chunks = chunks_;
+    *out = std::make_shared<ChunkedArray>(chunks_, builder_->type());
     return Status::OK();
   }
 
@@ -301,7 +301,7 @@ class Date32Converter
     int32_t t;
     if (PyDate_Check(obj)) {
       auto pydate = reinterpret_cast<PyDateTime_Date*>(obj);
-      t = static_cast<int32_t>(PyDate_to_days(pydate));
+      t = static_cast<int32_t>(internal::PyDate_to_days(pydate));
     } else {
       RETURN_NOT_OK(internal::CIntFromPython(obj, &t, "Integer too large for date32"));
     }
@@ -315,9 +315,14 @@ class Date64Converter
  public:
   Status AppendItem(PyObject* obj) {
     int64_t t;
-    if (PyDate_Check(obj)) {
+    if (PyDateTime_Check(obj)) {
+      auto pydate = reinterpret_cast<PyDateTime_DateTime*>(obj);
+      t = internal::PyDateTime_to_ms(pydate);
+      // Truncate any intraday milliseconds
+      t -= t % 86400000LL;
+    } else if (PyDate_Check(obj)) {
       auto pydate = reinterpret_cast<PyDateTime_Date*>(obj);
-      t = PyDate_to_ms(pydate);
+      t = internal::PyDate_to_ms(pydate);
     } else {
       RETURN_NOT_OK(internal::CIntFromPython(obj, &t, "Integer too large for date64"));
     }
@@ -338,10 +343,10 @@ class Time32Converter
       // datetime.time stores microsecond resolution
       switch (unit_) {
         case TimeUnit::SECOND:
-          t = static_cast<int32_t>(PyTime_to_s(obj));
+          t = static_cast<int32_t>(internal::PyTime_to_s(obj));
           break;
         case TimeUnit::MILLI:
-          t = static_cast<int32_t>(PyTime_to_ms(obj));
+          t = static_cast<int32_t>(internal::PyTime_to_ms(obj));
           break;
         default:
           return Status::UnknownError("Invalid time unit");
@@ -368,10 +373,10 @@ class Time64Converter
       // datetime.time stores microsecond resolution
       switch (unit_) {
         case TimeUnit::MICRO:
-          t = PyTime_to_us(obj);
+          t = internal::PyTime_to_us(obj);
           break;
         case TimeUnit::NANO:
-          t = PyTime_to_ns(obj);
+          t = internal::PyTime_to_ns(obj);
           break;
         default:
           return Status::UnknownError("Invalid time unit");
@@ -399,16 +404,16 @@ class TimestampConverter
 
       switch (unit_) {
         case TimeUnit::SECOND:
-          t = PyDateTime_to_s(pydatetime);
+          t = internal::PyDateTime_to_s(pydatetime);
           break;
         case TimeUnit::MILLI:
-          t = PyDateTime_to_ms(pydatetime);
+          t = internal::PyDateTime_to_ms(pydatetime);
           break;
         case TimeUnit::MICRO:
-          t = PyDateTime_to_us(pydatetime);
+          t = internal::PyDateTime_to_us(pydatetime);
           break;
         case TimeUnit::NANO:
-          t = PyDateTime_to_ns(pydatetime);
+          t = internal::PyDateTime_to_ns(pydatetime);
           break;
         default:
           return Status::UnknownError("Invalid time unit");
@@ -576,7 +581,7 @@ class StringConverter
     return Status::OK();
   }
 
-  virtual Status GetResult(std::vector<std::shared_ptr<Array>>* out) {
+  virtual Status GetResult(std::shared_ptr<ChunkedArray>* out) {
     RETURN_NOT_OK(SeqConverter::GetResult(out));
 
     // If we saw any non-unicode, cast results to BinaryArray
@@ -584,14 +589,9 @@ class StringConverter
       // We should have bailed out earlier
       DCHECK(!STRICT);
 
-      using EquivalentBinaryType = typename TypeClass::EquivalentBinaryType;
-      using EquivalentBinaryArray = typename TypeTraits<EquivalentBinaryType>::ArrayType;
-
-      for (size_t i = 0; i < out->size(); ++i) {
-        auto binary_data = (*out)[i]->data()->Copy();
-        binary_data->type = TypeTraits<EquivalentBinaryType>::type_singleton();
-        (*out)[i] = std::make_shared<EquivalentBinaryArray>(binary_data);
-      }
+      auto binary_type =
+          TypeTraits<typename TypeClass::EquivalentBinaryType>::type_singleton();
+      return (*out)->View(binary_type, out);
     }
     return Status::OK();
   }
@@ -606,90 +606,6 @@ class StringConverter
 
 // ----------------------------------------------------------------------
 // Convert lists (NumPy arrays containing lists or ndarrays as values)
-
-template <typename TypeClass>
-class ListConverter : public TypedConverter<TypeClass, ListConverter<TypeClass>> {
- public:
-  using BuilderType = typename TypeTraits<TypeClass>::BuilderType;
-
-  explicit ListConverter(bool from_pandas, bool strict_conversions)
-      : from_pandas_(from_pandas), strict_conversions_(strict_conversions) {}
-
-  Status Init(ArrayBuilder* builder) {
-    this->builder_ = builder;
-    this->typed_builder_ = checked_cast<BuilderType*>(builder);
-
-    value_type_ = checked_cast<const TypeClass&>(*builder->type()).value_type();
-    RETURN_NOT_OK(
-        GetConverter(value_type_, from_pandas_, strict_conversions_, &value_converter_));
-    return value_converter_->Init(this->typed_builder_->value_builder());
-  }
-
-  template <int NUMPY_TYPE, typename Type>
-  Status AppendNdarrayTypedItem(PyArrayObject* arr);
-  Status AppendNdarrayItem(PyObject* arr);
-
-  Status AppendItem(PyObject* obj) {
-    RETURN_NOT_OK(this->typed_builder_->Append());
-    if (PyArray_Check(obj)) {
-      return AppendNdarrayItem(obj);
-    }
-    const auto list_size = static_cast<int64_t>(PySequence_Size(obj));
-    if (ARROW_PREDICT_FALSE(list_size == -1)) {
-      RETURN_IF_PYERROR();
-    }
-    return value_converter_->AppendMultiple(obj, list_size);
-  }
-
-  virtual Status GetResult(std::vector<std::shared_ptr<Array>>* chunks) {
-    // TODO: Improved handling of chunked children
-    if (value_converter_->num_chunks() > 0) {
-      return Status::Invalid("List child type ",
-                             value_converter_->builder()->type()->ToString(),
-                             " overflowed the capacity of a single chunk");
-    }
-    return SeqConverter::GetResult(chunks);
-  }
-
- protected:
-  std::shared_ptr<DataType> value_type_;
-  std::unique_ptr<SeqConverter> value_converter_;
-  bool from_pandas_;
-  bool strict_conversions_;
-};
-
-template <typename TypeClass>
-template <int NUMPY_TYPE, typename Type>
-Status ListConverter<TypeClass>::AppendNdarrayTypedItem(PyArrayObject* arr) {
-  using traits = internal::npy_traits<NUMPY_TYPE>;
-  using T = typename traits::value_type;
-  using ValueBuilderType = typename TypeTraits<Type>::BuilderType;
-
-  const bool null_sentinels_possible =
-      // Always treat Numpy's NaT as null
-      NUMPY_TYPE == NPY_DATETIME ||
-      // Observing pandas's null sentinels
-      (from_pandas_ && traits::supports_nulls);
-
-  auto child_builder = checked_cast<ValueBuilderType*>(value_converter_->builder());
-
-  // TODO(wesm): Vector append when not strided
-  Ndarray1DIndexer<T> values(arr);
-  if (null_sentinels_possible) {
-    for (int64_t i = 0; i < values.size(); ++i) {
-      if (traits::isnull(values[i])) {
-        RETURN_NOT_OK(child_builder->AppendNull());
-      } else {
-        RETURN_NOT_OK(child_builder->Append(values[i]));
-      }
-    }
-  } else {
-    for (int64_t i = 0; i < values.size(); ++i) {
-      RETURN_NOT_OK(child_builder->Append(values[i]));
-    }
-  }
-  return Status::OK();
-}
 
 // If the value type does not match the expected NumPy dtype, then fall through
 // to a slower PySequence-based path
@@ -707,67 +623,151 @@ Status ListConverter<TypeClass>::AppendNdarrayTypedItem(PyArrayObject* arr) {
     return value_converter_->AppendMultiple(obj, value_length); \
   }
 
-template <typename TypeClass>
-Status ListConverter<TypeClass>::AppendNdarrayItem(PyObject* obj) {
-  PyArrayObject* arr = reinterpret_cast<PyArrayObject*>(obj);
+template <typename TypeClass, NullCoding null_coding>
+class ListConverter
+    : public TypedConverter<TypeClass, ListConverter<TypeClass, null_coding>,
+                            null_coding> {
+ public:
+  using BuilderType = typename TypeTraits<TypeClass>::BuilderType;
 
-  if (PyArray_NDIM(arr) != 1) {
-    return Status::Invalid("Can only convert 1-dimensional array values");
+  explicit ListConverter(bool from_pandas, bool strict_conversions)
+      : from_pandas_(from_pandas), strict_conversions_(strict_conversions) {}
+
+  Status Init(ArrayBuilder* builder) {
+    this->builder_ = builder;
+    this->typed_builder_ = checked_cast<BuilderType*>(builder);
+
+    value_type_ = checked_cast<const TypeClass&>(*builder->type()).value_type();
+    RETURN_NOT_OK(
+        GetConverter(value_type_, from_pandas_, strict_conversions_, &value_converter_));
+    return value_converter_->Init(this->typed_builder_->value_builder());
   }
 
-  const int64_t value_length = PyArray_SIZE(arr);
+  template <int NUMPY_TYPE, typename Type>
+  Status AppendNdarrayTypedItem(PyArrayObject* arr) {
+    using traits = internal::npy_traits<NUMPY_TYPE>;
+    using T = typename traits::value_type;
+    using ValueBuilderType = typename TypeTraits<Type>::BuilderType;
 
-  switch (value_type_->id()) {
-    LIST_SLOW_CASE(NA)
-    LIST_FAST_CASE(UINT8, NPY_UINT8, UInt8Type)
-    LIST_FAST_CASE(INT8, NPY_INT8, Int8Type)
-    LIST_FAST_CASE(UINT16, NPY_UINT16, UInt16Type)
-    LIST_FAST_CASE(INT16, NPY_INT16, Int16Type)
-    LIST_FAST_CASE(UINT32, NPY_UINT32, UInt32Type)
-    LIST_FAST_CASE(INT32, NPY_INT32, Int32Type)
-    LIST_FAST_CASE(UINT64, NPY_UINT64, UInt64Type)
-    LIST_FAST_CASE(INT64, NPY_INT64, Int64Type)
-    LIST_SLOW_CASE(DATE32)
-    LIST_SLOW_CASE(DATE64)
-    LIST_SLOW_CASE(TIME32)
-    LIST_SLOW_CASE(TIME64)
-    LIST_FAST_CASE(TIMESTAMP, NPY_DATETIME, TimestampType)
-    LIST_FAST_CASE(HALF_FLOAT, NPY_FLOAT16, HalfFloatType)
-    LIST_FAST_CASE(FLOAT, NPY_FLOAT, FloatType)
-    LIST_FAST_CASE(DOUBLE, NPY_DOUBLE, DoubleType)
-    LIST_SLOW_CASE(BINARY)
-    LIST_SLOW_CASE(FIXED_SIZE_BINARY)
-    LIST_SLOW_CASE(STRING)
-    case Type::LIST: {
-      if (PyArray_DESCR(arr)->type_num != NPY_OBJECT) {
-        return Status::Invalid(
-            "Can only convert list types from NumPy object "
-            "array input");
+    const bool null_sentinels_possible =
+        // Always treat Numpy's NaT as null
+        NUMPY_TYPE == NPY_DATETIME ||
+        // Observing pandas's null sentinels
+        (from_pandas_ && traits::supports_nulls);
+
+    auto child_builder = checked_cast<ValueBuilderType*>(value_converter_->builder());
+
+    // TODO(wesm): Vector append when not strided
+    Ndarray1DIndexer<T> values(arr);
+    if (null_sentinels_possible) {
+      for (int64_t i = 0; i < values.size(); ++i) {
+        if (traits::isnull(values[i])) {
+          RETURN_NOT_OK(child_builder->AppendNull());
+        } else {
+          RETURN_NOT_OK(child_builder->Append(values[i]));
+        }
       }
-      return internal::VisitSequence(obj, [this](PyObject* item, bool*) {
-        return value_converter_->AppendSingleVirtual(item);
-      });
+    } else {
+      for (int64_t i = 0; i < values.size(); ++i) {
+        RETURN_NOT_OK(child_builder->Append(values[i]));
+      }
     }
-    default: {
-      return Status::TypeError("Unknown list item type: ", value_type_->ToString());
+    return Status::OK();
+  }
+
+  Status AppendNdarrayItem(PyObject* obj) {
+    PyArrayObject* arr = reinterpret_cast<PyArrayObject*>(obj);
+
+    if (PyArray_NDIM(arr) != 1) {
+      return Status::Invalid("Can only convert 1-dimensional array values");
+    }
+
+    const int64_t value_length = PyArray_SIZE(arr);
+
+    switch (value_type_->id()) {
+      LIST_SLOW_CASE(NA)
+      LIST_FAST_CASE(UINT8, NPY_UINT8, UInt8Type)
+      LIST_FAST_CASE(INT8, NPY_INT8, Int8Type)
+      LIST_FAST_CASE(UINT16, NPY_UINT16, UInt16Type)
+      LIST_FAST_CASE(INT16, NPY_INT16, Int16Type)
+      LIST_FAST_CASE(UINT32, NPY_UINT32, UInt32Type)
+      LIST_FAST_CASE(INT32, NPY_INT32, Int32Type)
+      LIST_FAST_CASE(UINT64, NPY_UINT64, UInt64Type)
+      LIST_FAST_CASE(INT64, NPY_INT64, Int64Type)
+      LIST_SLOW_CASE(DATE32)
+      LIST_SLOW_CASE(DATE64)
+      LIST_SLOW_CASE(TIME32)
+      LIST_SLOW_CASE(TIME64)
+      LIST_FAST_CASE(TIMESTAMP, NPY_DATETIME, TimestampType)
+      LIST_FAST_CASE(HALF_FLOAT, NPY_FLOAT16, HalfFloatType)
+      LIST_FAST_CASE(FLOAT, NPY_FLOAT, FloatType)
+      LIST_FAST_CASE(DOUBLE, NPY_DOUBLE, DoubleType)
+      LIST_SLOW_CASE(BINARY)
+      LIST_SLOW_CASE(FIXED_SIZE_BINARY)
+      LIST_SLOW_CASE(STRING)
+      case Type::LIST: {
+        if (PyArray_DESCR(arr)->type_num != NPY_OBJECT) {
+          return Status::Invalid(
+              "Can only convert list types from NumPy object "
+              "array input");
+        }
+        return internal::VisitSequence(obj, [this](PyObject* item, bool*) {
+          return value_converter_->AppendSingleVirtual(item);
+        });
+      }
+      default: {
+        return Status::TypeError("Unknown list item type: ", value_type_->ToString());
+      }
     }
   }
-}
+
+  Status AppendItem(PyObject* obj) {
+    RETURN_NOT_OK(this->typed_builder_->Append());
+    if (PyArray_Check(obj)) {
+      return AppendNdarrayItem(obj);
+    }
+    if (!PySequence_Check(obj)) {
+      return internal::InvalidType(obj,
+                                   "was not a sequence or recognized null"
+                                   " for conversion to list type");
+    }
+    int64_t list_size = static_cast<int64_t>(PySequence_Size(obj));
+    return value_converter_->AppendMultiple(obj, list_size);
+  }
+
+  virtual Status GetResult(std::shared_ptr<ChunkedArray>* out) {
+    // TODO: Improved handling of chunked children
+    if (value_converter_->num_chunks() > 0) {
+      return Status::Invalid("List child type ",
+                             value_converter_->builder()->type()->ToString(),
+                             " overflowed the capacity of a single chunk");
+    }
+    return SeqConverter::GetResult(out);
+  }
+
+ protected:
+  std::shared_ptr<DataType> value_type_;
+  std::unique_ptr<SeqConverter> value_converter_;
+  bool from_pandas_;
+  bool strict_conversions_;
+};
 
 // ----------------------------------------------------------------------
 // Convert structs
 
-class StructConverter : public TypedConverter<StructType, StructConverter> {
+template <NullCoding null_coding>
+class StructConverter
+    : public TypedConverter<StructType, StructConverter<null_coding>, null_coding> {
  public:
   explicit StructConverter(bool from_pandas, bool strict_conversions)
       : from_pandas_(from_pandas), strict_conversions_(strict_conversions) {}
 
   Status Init(ArrayBuilder* builder) {
-    builder_ = builder;
-    typed_builder_ = checked_cast<StructBuilder*>(builder);
+    this->builder_ = builder;
+    this->typed_builder_ = checked_cast<StructBuilder*>(builder);
     const auto& struct_type = checked_cast<const StructType&>(*builder->type());
 
-    num_fields_ = typed_builder_->num_fields();
+    num_fields_ = this->typed_builder_->num_fields();
     DCHECK_EQ(num_fields_, struct_type.num_children());
 
     field_name_list_.reset(PyList_New(num_fields_));
@@ -781,7 +781,7 @@ class StructConverter : public TypedConverter<StructType, StructConverter> {
       std::unique_ptr<SeqConverter> value_converter;
       RETURN_NOT_OK(
           GetConverter(field_type, from_pandas_, strict_conversions_, &value_converter));
-      RETURN_NOT_OK(value_converter->Init(typed_builder_->field_builder(i)));
+      RETURN_NOT_OK(value_converter->Init(this->typed_builder_->field_builder(i)));
       value_converters_.push_back(std::move(value_converter));
 
       // Store the field name as a PyObject, for dict matching
@@ -795,7 +795,7 @@ class StructConverter : public TypedConverter<StructType, StructConverter> {
   }
 
   Status AppendItem(PyObject* obj) {
-    RETURN_NOT_OK(typed_builder_->Append());
+    RETURN_NOT_OK(this->typed_builder_->Append());
     // Note heterogenous sequences are not allowed
     if (ARROW_PREDICT_FALSE(source_kind_ == UNKNOWN)) {
       if (PyDict_Check(obj)) {
@@ -809,13 +809,15 @@ class StructConverter : public TypedConverter<StructType, StructConverter> {
     } else if (PyTuple_Check(obj) && source_kind_ == TUPLES) {
       return AppendTupleItem(obj);
     } else {
-      return Status::TypeError("Expected sequence of dicts or tuples for struct type");
+      return internal::InvalidType(obj,
+                                   "was not a dict, tuple, or recognized null value"
+                                   " for conversion to struct type");
     }
   }
 
   // Append a missing item
   Status AppendNull() {
-    RETURN_NOT_OK(typed_builder_->AppendNull());
+    RETURN_NOT_OK(this->typed_builder_->AppendNull());
     // Need to also insert a missing item on all child builders
     // (compare with ListConverter)
     for (int i = 0; i < num_fields_; i++) {
@@ -959,16 +961,36 @@ Status GetConverter(const std::shared_ptr<DataType>& type, bool from_pandas,
                     bool strict_conversions, std::unique_ptr<SeqConverter>* out) {
   switch (type->id()) {
     case Type::LIST:
-      *out = std::unique_ptr<SeqConverter>(
-          new ListConverter<ListType>(from_pandas, strict_conversions));
+      if (from_pandas) {
+        *out = std::unique_ptr<SeqConverter>(
+            new ListConverter<ListType, NullCoding::PANDAS_SENTINELS>(
+                from_pandas, strict_conversions));
+      } else {
+        *out = std::unique_ptr<SeqConverter>(
+            new ListConverter<ListType, NullCoding::NONE_ONLY>(from_pandas,
+                                                               strict_conversions));
+      }
       return Status::OK();
     case Type::LARGE_LIST:
-      *out = std::unique_ptr<SeqConverter>(
-          new ListConverter<LargeListType>(from_pandas, strict_conversions));
+      if (from_pandas) {
+        *out = std::unique_ptr<SeqConverter>(
+            new ListConverter<LargeListType, NullCoding::PANDAS_SENTINELS>(
+                from_pandas, strict_conversions));
+      } else {
+        *out = std::unique_ptr<SeqConverter>(
+            new ListConverter<LargeListType, NullCoding::NONE_ONLY>(from_pandas,
+                                                                    strict_conversions));
+      }
       return Status::OK();
     case Type::STRUCT:
-      *out = std::unique_ptr<SeqConverter>(
-          new StructConverter(from_pandas, strict_conversions));
+      if (from_pandas) {
+        *out = std::unique_ptr<SeqConverter>(
+            new StructConverter<NullCoding::PANDAS_SENTINELS>(from_pandas,
+                                                              strict_conversions));
+      } else {
+        *out = std::unique_ptr<SeqConverter>(
+            new StructConverter<NullCoding::NONE_ONLY>(from_pandas, strict_conversions));
+      }
       return Status::OK();
     default:
       break;
@@ -1078,11 +1100,7 @@ Status ConvertPySequence(PyObject* sequence_source, PyObject* mask,
   }
 
   // Retrieve result. Conversion may yield one or more array values
-  std::vector<std::shared_ptr<Array>> chunks;
-  RETURN_NOT_OK(converter->GetResult(&chunks));
-
-  *out = std::make_shared<ChunkedArray>(chunks);
-  return Status::OK();
+  return converter->GetResult(out);
 }
 
 Status ConvertPySequence(PyObject* obj, const PyConversionOptions& options,

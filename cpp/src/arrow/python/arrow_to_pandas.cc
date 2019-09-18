@@ -46,13 +46,13 @@
 
 #include "arrow/python/common.h"
 #include "arrow/python/config.h"
+#include "arrow/python/datetime.h"
 #include "arrow/python/decimal.h"
 #include "arrow/python/helpers.h"
 #include "arrow/python/numpy_convert.h"
 #include "arrow/python/numpy_internal.h"
 #include "arrow/python/python_to_arrow.h"
 #include "arrow/python/type_traits.h"
-#include "arrow/python/util/datetime.h"
 
 namespace arrow {
 
@@ -556,7 +556,8 @@ inline Status ConvertListsLike(const PandasOptions& options, const ChunkedArray&
     const auto& arr = checked_cast<const ListArray&>(*data.chunk(c));
     value_arrays.emplace_back(arr.values());
   }
-  auto flat_column = std::make_shared<ChunkedArray>(value_arrays);
+  auto value_type = checked_cast<const ListType&>(*data.type()).value_type();
+  auto flat_column = std::make_shared<ChunkedArray>(value_arrays, value_type);
   // TODO(ARROW-489): Currently we don't have a Python reference for single columns.
   //    Storing a reference to the whole Array would be to expensive.
 
@@ -654,7 +655,7 @@ static Status ConvertDates(const PandasOptions& options, const ChunkedArray& dat
     PyDateTime_IMPORT;
   }
   auto WrapValue = [](typename Type::c_type value, PyObject** out) {
-    RETURN_NOT_OK(PyDate_from_int(value, Type::UNIT, out));
+    RETURN_NOT_OK(internal::PyDate_from_int(value, Type::UNIT, out));
     RETURN_IF_PYERROR();
     return Status::OK();
   };
@@ -672,7 +673,7 @@ static Status ConvertTimes(const PandasOptions& options, const ChunkedArray& dat
   const TimeUnit::type unit = checked_cast<const Type&>(*data.type()).unit();
 
   auto WrapValue = [unit](typename Type::c_type value, PyObject** out) {
-    RETURN_NOT_OK(PyTime_from_int(value, unit, out));
+    RETURN_NOT_OK(internal::PyTime_from_int(value, unit, out));
     RETURN_IF_PYERROR();
     return Status::OK();
   };
@@ -1855,6 +1856,7 @@ class ArrowDeserializer {
     auto out_values = reinterpret_cast<PyObject**>(PyArray_DATA(arr_));
     auto list_type = std::static_pointer_cast<ListType>(data_->type());
     switch (list_type->value_type()->id()) {
+      CONVERTVALUES_LISTSLIKE_CASE(BooleanType, BOOL)
       CONVERTVALUES_LISTSLIKE_CASE(UInt8Type, UINT8)
       CONVERTVALUES_LISTSLIKE_CASE(Int8Type, INT8)
       CONVERTVALUES_LISTSLIKE_CASE(UInt16Type, UINT16)
@@ -1950,6 +1952,11 @@ Status ConvertTableToPandas(const PandasOptions& options,
     FunctionContext ctx;
     for (int i = 0; i < table->num_columns(); i++) {
       std::shared_ptr<ChunkedArray> col = table->column(i);
+      if (col->type()->id() == Type::DICTIONARY) {
+        // No need to dictionary encode again. Came up in ARROW-6434,
+        // ARROW-6435
+        continue;
+      }
       if (categorical_columns.count(table->field(i)->name())) {
         Datum out;
         RETURN_NOT_OK(DictionaryEncode(&ctx, Datum(col), &out));

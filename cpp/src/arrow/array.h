@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef ARROW_ARRAY_H
-#define ARROW_ARRAY_H
+#pragma once
 
 #include <cstdint>
 #include <iosfwd>
@@ -229,6 +228,32 @@ ARROW_EXPORT
 Status MakeArrayOfNull(const std::shared_ptr<DataType>& type, int64_t length,
                        std::shared_ptr<Array>* out);
 
+/// \brief Create a strongly-typed Array instance with all elements null
+/// \param[in] pool the pool from which memory for this array will be allocated
+/// \param[in] type the array type
+/// \param[in] length the array length
+/// \param[out] out resulting Array instance
+ARROW_EXPORT
+Status MakeArrayOfNull(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                       int64_t length, std::shared_ptr<Array>* out);
+
+/// \brief Create an Array instance whose slots are the given scalar
+/// \param[in] scalar the value with which to fill the array
+/// \param[in] length the array length
+/// \param[out] out resulting Array instance
+ARROW_EXPORT
+Status MakeArrayFromScalar(const Scalar& scalar, int64_t length,
+                           std::shared_ptr<Array>* out);
+
+/// \brief Create a strongly-typed Array instance with all elements null
+/// \param[in] pool the pool from which memory for this array will be allocated
+/// \param[in] scalar the value with which to fill the array
+/// \param[in] length the array length
+/// \param[out] out resulting Array instance
+ARROW_EXPORT
+Status MakeArrayFromScalar(MemoryPool* pool, const Scalar& scalar, int64_t length,
+                           std::shared_ptr<Array>* out);
+
 // ----------------------------------------------------------------------
 // User array accessor types
 
@@ -292,6 +317,10 @@ class ARROW_EXPORT Array {
   bool Equals(const Array& arr, const EqualOptions& = EqualOptions::Defaults()) const;
   bool Equals(const std::shared_ptr<Array>& arr,
               const EqualOptions& = EqualOptions::Defaults()) const;
+
+  /// \brief Return the formatted unified diff of arrow::Diff between this
+  /// Array and another Array
+  std::string Diff(const Array& other) const;
 
   /// Approximate equality comparison with another array
   ///
@@ -1224,6 +1253,9 @@ class ARROW_EXPORT DictionaryArray : public Array {
                    const std::vector<int32_t>& transpose_map,
                    std::shared_ptr<Array>* out) const;
 
+  /// \brief Determine whether dictionary arrays may be compared without unification
+  bool CanCompareIndices(const DictionaryArray& other) const;
+
   /// \brief Return the dictionary for this array, which is stored as
   /// a member of the ArrayData internal structure
   std::shared_ptr<Array> dictionary() const;
@@ -1246,5 +1278,3 @@ ARROW_EXPORT
 Status ValidateArray(const Array& array);
 
 }  // namespace arrow
-
-#endif  // ARROW_ARRAY_H

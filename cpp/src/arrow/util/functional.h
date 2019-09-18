@@ -28,7 +28,7 @@ namespace internal {
 /// TODO(bkietz) support function pointers
 /// TODO(bkietz) provide return_type accessor
 struct call_traits {
- private:
+ public:
   template <typename R, typename... A>
   static std::false_type is_overloaded_impl(R(A...));
 
@@ -46,7 +46,6 @@ struct call_traits {
   static typename std::tuple_element<I, std::tuple<A...>>::type argument_type_impl(
       R (F::*)(A...) const);
 
- public:
   /// bool constant indicating whether F is a callable with more than one possible
   /// signature. Will be true_type for objects which define multiple operator() or which
   /// define a template operator()
@@ -66,6 +65,17 @@ struct call_traits {
   template <std::size_t I, typename F>
   using argument_type = decltype(argument_type_impl<I>(&std::decay<F>::type::operator()));
 };
+
+template <typename T>
+struct type_constant {
+  using type = T;
+};
+
+template <std::size_t I, typename T, typename R, typename... A>
+constexpr type_constant<typename std::tuple_element<I, std::tuple<A...>>::type>
+member_function_argument_type(R (T::*fn)(A...)) {
+  return {};
+}
 
 }  // namespace internal
 }  // namespace arrow

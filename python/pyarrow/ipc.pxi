@@ -76,13 +76,14 @@ cdef class Message:
         """
         cdef:
             int64_t output_length = 0
-            int32_t c_alignment = alignment
             OutputStream* out
+            CIpcOptions options
 
+        options.alignment = alignment
         out = sink.get_output_stream().get()
         with nogil:
             check_status(self.message.get()
-                         .SerializeTo(out, c_alignment, &output_length))
+                         .SerializeTo(out, options, &output_length))
 
     def serialize(self, alignment=8, memory_pool=None):
         """
@@ -576,7 +577,8 @@ def read_schema(obj, DictionaryMemo dictionary_memo=None):
 def read_record_batch(obj, Schema schema,
                       DictionaryMemo dictionary_memo=None):
     """
-    Read RecordBatch from message, given a known schema
+    Read RecordBatch from message, given a known schema. If reading data from a
+    complete IPC stream, use ipc.open_stream instead
 
     Parameters
     ----------

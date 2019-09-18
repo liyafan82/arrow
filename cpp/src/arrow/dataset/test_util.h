@@ -56,48 +56,104 @@ class GeneratedRecordBatch : public RecordBatchReader {
   Gen gen_;
 };
 
+void EnsureRecordBatchReaderDrained(RecordBatchReader* reader) {
+  std::shared_ptr<RecordBatch> batch = nullptr;
+
+  ARROW_EXPECT_OK(reader->Next(&batch));
+  EXPECT_EQ(batch, nullptr);
+}
+
 class DatasetFixtureMixin : public ::testing::Test {
  public:
   DatasetFixtureMixin() : ctx_(std::make_shared<ScanContext>()) {}
 
- protected:
-  std::shared_ptr<ScanOptions> options_;
-  std::shared_ptr<ScanContext> ctx_;
-};
-
-class TestDataFragmentMixin : public DatasetFixtureMixin {
- public:
   /// \brief Ensure that record batches found in reader are equals to the
   /// record batches yielded by the data fragment.
-  void AssertFragmentEquals(RecordBatchReader* expected, DataFragment* fragment) {
-    std::unique_ptr<ScanTaskIterator> it;
-    ARROW_EXPECT_OK(fragment->Scan(ctx_, &it));
-
-    ARROW_EXPECT_OK(it->Visit([expected](std::unique_ptr<ScanTask> task) -> Status {
-      auto batch_it = task->Scan();
-      return batch_it->Visit([expected](std::shared_ptr<RecordBatch> rhs) -> Status {
-        std::shared_ptr<RecordBatch> lhs;
-        RETURN_NOT_OK(expected->ReadNext(&lhs));
-        EXPECT_NE(lhs, nullptr);
-        AssertBatchesEqual(*lhs, *rhs);
-        return Status::OK();
-      });
-    }));
-  }
-};
-
-class TestDataSourceMixin : public TestDataFragmentMixin {
- public:
-  /// \brief Ensure that record batches found in reader are equals to the
-  /// record batches yielded by the data fragments of a source.
-  void AssertDataSourceEquals(RecordBatchReader* expected, DataSource* source) {
-    auto it = source->GetFragments(options_);
-
-    ARROW_EXPECT_OK(it->Visit([&](std::shared_ptr<DataFragment> fragment) -> Status {
-      AssertFragmentEquals(expected, fragment.get());
+  void AssertScanTaskEquals(RecordBatchReader* expected, ScanTask* task,
+                            bool ensure_drained = true) {
+    auto it = task->Scan();
+    ARROW_EXPECT_OK(it.Visit([expected](std::shared_ptr<RecordBatch> rhs) -> Status {
+      std::shared_ptr<RecordBatch> lhs;
+      RETURN_NOT_OK(expected->ReadNext(&lhs));
+      EXPECT_NE(lhs, nullptr);
+      AssertBatchesEqual(*lhs, *rhs);
       return Status::OK();
     }));
+
+    if (ensure_drained) {
+      EnsureRecordBatchReaderDrained(expected);
+    }
   }
+
+  /// \brief Ensure that record batches found in reader are equals to the
+  /// record batches yielded by the data fragment.
+  void AssertFragmentEquals(RecordBatchReader* expected, DataFragment* fragment,
+                            bool ensure_drained = true) {
+    ScanTaskIterator it;
+    ARROW_EXPECT_OK(fragment->Scan(ctx_, &it));
+
+    ARROW_EXPECT_OK(it.Visit([&](std::unique_ptr<ScanTask> task) -> Status {
+      AssertScanTaskEquals(expected, task.get(), false);
+      return Status::OK();
+    }));
+
+    if (ensure_drained) {
+      EnsureRecordBatchReaderDrained(expected);
+    }
+  }
+
+  /// \brief Ensure that record batches found in reader are equals to the
+  /// record batches yielded by the data fragments of a source.
+  void AssertDataSourceEquals(RecordBatchReader* expected, DataSource* source,
+                              bool ensure_drained = true) {
+    auto it = source->GetFragments(options_);
+
+    ARROW_EXPECT_OK(it.Visit([&](std::shared_ptr<DataFragment> fragment) -> Status {
+      AssertFragmentEquals(expected, fragment.get(), false);
+      return Status::OK();
+    }));
+
+    if (ensure_drained) {
+      EnsureRecordBatchReaderDrained(expected);
+    }
+  }
+
+  /// \brief Ensure that record batches found in reader are equals to the
+  /// record batches yielded by a scanner.
+  void AssertScannerEquals(RecordBatchReader* expected, Scanner* scanner,
+                           bool ensure_drained = true) {
+    auto it = scanner->Scan();
+
+    ARROW_EXPECT_OK(it.Visit([&](std::unique_ptr<ScanTask> task) -> Status {
+      AssertScanTaskEquals(expected, task.get(), false);
+      return Status::OK();
+    }));
+
+    if (ensure_drained) {
+      EnsureRecordBatchReaderDrained(expected);
+    }
+  }
+
+  /// \brief Ensure that record batches found in reader are equals to the
+  /// record batches yielded by a dataset.
+  void AssertDatasetEquals(RecordBatchReader* expected, Dataset* dataset,
+                           bool ensure_drained = true) {
+    std::unique_ptr<ScannerBuilder> builder;
+    ASSERT_OK(dataset->NewScan(&builder));
+
+    std::unique_ptr<Scanner> scanner;
+    ASSERT_OK(builder->Finish(&scanner));
+
+    AssertScannerEquals(expected, scanner.get());
+
+    if (ensure_drained) {
+      EnsureRecordBatchReaderDrained(expected);
+    }
+  }
+
+ protected:
+  std::shared_ptr<ScanOptions> options_ = nullptr;
+  std::shared_ptr<ScanContext> ctx_;
 };
 
 template <typename Format>
@@ -142,7 +198,7 @@ class FileSystemBasedDataSourceMixin : public FileSourceFixtureMixin {
 
     int count = 0;
     ASSERT_OK(
-        source_->GetFragments({})->Visit([&](std::shared_ptr<DataFragment> fragment) {
+        source_->GetFragments({}).Visit([&](std::shared_ptr<DataFragment> fragment) {
           auto file_fragment =
               internal::checked_pointer_cast<FileBasedDataFragment>(fragment);
           ++count;
@@ -163,7 +219,7 @@ class FileSystemBasedDataSourceMixin : public FileSourceFixtureMixin {
 
     int count = 0;
     ASSERT_OK(
-        source_->GetFragments({})->Visit([&](std::shared_ptr<DataFragment> fragment) {
+        source_->GetFragments({}).Visit([&](std::shared_ptr<DataFragment> fragment) {
           auto file_fragment =
               internal::checked_pointer_cast<FileBasedDataFragment>(fragment);
           ++count;
@@ -186,7 +242,7 @@ class FileSystemBasedDataSourceMixin : public FileSourceFixtureMixin {
 
     ASSERT_RAISES(
         IOError,
-        source_->GetFragments({})->Visit([&](std::shared_ptr<DataFragment> fragment) {
+        source_->GetFragments({}).Visit([&](std::shared_ptr<DataFragment> fragment) {
           auto file_fragment =
               internal::checked_pointer_cast<FileBasedDataFragment>(fragment);
           auto extension =
@@ -222,8 +278,8 @@ class DummyFileFormat : public FileFormat {
   /// \brief Open a file for scanning (always returns an empty iterator)
   Status ScanFile(const FileSource& source, std::shared_ptr<ScanOptions> scan_options,
                   std::shared_ptr<ScanContext> scan_context,
-                  std::unique_ptr<ScanTaskIterator>* out) const override {
-    *out = internal::make_unique<EmptyIterator<std::unique_ptr<ScanTask>>>();
+                  ScanTaskIterator* out) const override {
+    *out = MakeEmptyIterator<std::unique_ptr<ScanTask>>();
     return Status::OK();
   }
 

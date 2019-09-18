@@ -26,6 +26,7 @@
 #include <utility>
 
 #include "arrow/buffer.h"
+#include "arrow/buffer_builder.h"
 #include "arrow/compare.h"
 #include "arrow/extension_type.h"
 #include "arrow/pretty_print.h"
@@ -36,7 +37,6 @@
 #include "arrow/util/bit_util.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/decimal.h"
-#include "arrow/util/int_util.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/macros.h"
 #include "arrow/visitor.h"
@@ -107,6 +107,12 @@ int64_t ArrayData::GetNullCount() const {
 // Base array class
 
 int64_t Array::null_count() const { return data_->GetNullCount(); }
+
+std::string Array::Diff(const Array& other) const {
+  std::stringstream diff;
+  ARROW_IGNORE_EXPR(Equals(other, EqualOptions().diff_sink(&diff)));
+  return diff.str();
+}
 
 bool Array::Equals(const Array& arr, const EqualOptions& opts) const {
   return ArrayEquals(*this, arr, opts);
@@ -626,6 +632,7 @@ std::shared_ptr<Array> StructArray::GetFieldByName(const std::string& name) cons
 
 Status StructArray::Flatten(MemoryPool* pool, ArrayVector* out) const {
   ArrayVector flattened;
+  flattened.reserve(data_->child_data.size());
   std::shared_ptr<Buffer> null_bitmap = data_->buffers[0];
 
   for (auto& child_data : data_->child_data) {
@@ -906,108 +913,17 @@ Status DictionaryArray::FromArrays(const std::shared_ptr<DataType>& type,
   return Status::OK();
 }
 
-static bool IsTrivialTransposition(const std::vector<int32_t>& transpose_map,
-                                   int64_t input_dict_size) {
-  for (int64_t i = 0; i < input_dict_size; ++i) {
-    if (transpose_map[i] != i) {
-      return false;
-    }
-  }
-  return true;
-}
+bool DictionaryArray::CanCompareIndices(const DictionaryArray& other) const {
+  DCHECK(dictionary()->type()->Equals(other.dictionary()->type()))
+      << "dictionaries have differing type " << *dictionary()->type() << " vs "
+      << *other.dictionary()->type();
 
-template <typename InType, typename OutType>
-static Status TransposeDictIndices(MemoryPool* pool, const ArrayData& in_data,
-                                   const std::vector<int32_t>& transpose_map,
-                                   const std::shared_ptr<ArrayData>& out_data,
-                                   std::shared_ptr<Array>* out) {
-  using in_c_type = typename InType::c_type;
-  using out_c_type = typename OutType::c_type;
-  internal::TransposeInts(in_data.GetValues<in_c_type>(1),
-                          out_data->GetMutableValues<out_c_type>(1), in_data.length,
-                          transpose_map.data());
-  *out = MakeArray(out_data);
-  return Status::OK();
-}
-
-Status DictionaryArray::Transpose(MemoryPool* pool, const std::shared_ptr<DataType>& type,
-                                  const std::shared_ptr<Array>& dictionary,
-                                  const std::vector<int32_t>& transpose_map,
-                                  std::shared_ptr<Array>* out) const {
-  if (type->id() != Type::DICTIONARY) {
-    return Status::TypeError("Expected dictionary type");
-  }
-  const int64_t in_dict_len = data_->dictionary->length();
-  if (in_dict_len > static_cast<int64_t>(transpose_map.size())) {
-    return Status::Invalid(
-        "Transpose map too small for dictionary array "
-        "(has ",
-        transpose_map.size(), " values, need at least ", in_dict_len, ")");
+  if (!indices()->type()->Equals(other.indices()->type())) {
+    return false;
   }
 
-  const auto& out_dict_type = checked_cast<const DictionaryType&>(*type);
-
-  const auto& out_index_type =
-      static_cast<const FixedWidthType&>(*out_dict_type.index_type());
-
-  auto in_type_id = dict_type_->index_type()->id();
-  auto out_type_id = out_index_type.id();
-
-  if (in_type_id == out_type_id && IsTrivialTransposition(transpose_map, in_dict_len)) {
-    // Index type and values will be identical => we can simply reuse
-    // the existing buffers.
-    auto out_data =
-        ArrayData::Make(type, data_->length, {data_->buffers[0], data_->buffers[1]},
-                        data_->null_count, data_->offset);
-    out_data->dictionary = dictionary;
-    *out = MakeArray(out_data);
-    return Status::OK();
-  }
-
-  // Default path: compute a buffer of transposed indices.
-  std::shared_ptr<Buffer> out_buffer;
-  RETURN_NOT_OK(AllocateBuffer(
-      pool, data_->length * out_index_type.bit_width() * CHAR_BIT, &out_buffer));
-
-  // Shift null buffer if the original offset is non-zero
-  std::shared_ptr<Buffer> null_bitmap;
-  if (data_->offset != 0) {
-    RETURN_NOT_OK(
-        CopyBitmap(pool, null_bitmap_data_, data_->offset, data_->length, &null_bitmap));
-  } else {
-    null_bitmap = data_->buffers[0];
-  }
-
-  auto out_data =
-      ArrayData::Make(type, data_->length, {null_bitmap, out_buffer}, data_->null_count);
-  out_data->dictionary = dictionary;
-
-#define TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, OUT_INDEX_TYPE)    \
-  case OUT_INDEX_TYPE::type_id:                                 \
-    return TransposeDictIndices<IN_INDEX_TYPE, OUT_INDEX_TYPE>( \
-        pool, *data_, transpose_map, out_data, out);
-
-#define TRANSPOSE_IN_CASE(IN_INDEX_TYPE)                        \
-  case IN_INDEX_TYPE::type_id:                                  \
-    switch (out_type_id) {                                      \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int8Type)            \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int16Type)           \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int32Type)           \
-      TRANSPOSE_IN_OUT_CASE(IN_INDEX_TYPE, Int64Type)           \
-      default:                                                  \
-        return Status::NotImplemented("unexpected index type"); \
-    }
-
-  switch (in_type_id) {
-    TRANSPOSE_IN_CASE(Int8Type)
-    TRANSPOSE_IN_CASE(Int16Type)
-    TRANSPOSE_IN_CASE(Int32Type)
-    TRANSPOSE_IN_CASE(Int64Type)
-    default:
-      return Status::NotImplemented("unexpected index type");
-  }
-#undef TRANSPOSE_IN_CASE
-#undef TRANSPOSE_IN_OUT_CASE
+  auto min_length = std::min(dictionary()->length(), other.dictionary()->length());
+  return dictionary()->RangeEquals(other.dictionary(), 0, min_length, 0);
 }
 
 // ----------------------------------------------------------------------
@@ -1084,15 +1000,6 @@ struct ViewDataImpl {
     return Status::OK();
   }
 
-  Status CheckInputAtZeroOffset() {
-    for (const auto& data : in_data) {
-      if (data->offset != 0) {
-        return InvalidView("input has non-zero offset");
-      }
-    }
-    return Status::OK();
-  }
-
   Status GetDictionaryView(const DataType& out_type, std::shared_ptr<Array>* out) {
     if (in_data[in_layout_idx]->type->id() != Type::DICTIONARY) {
       return InvalidView("Cannot get view as dictionary type");
@@ -1108,6 +1015,7 @@ struct ViewDataImpl {
 
     AdjustInputPointer();
     int64_t out_length = in_data_length;
+    int64_t out_offset = 0;
     int64_t out_null_count;
 
     std::shared_ptr<Array> dictionary;
@@ -1139,6 +1047,7 @@ struct ViewDataImpl {
       DCHECK_GT(in_data_item->buffers.size(), in_buffer_idx);
       out_buffers.push_back(in_data_item->buffers[in_buffer_idx]);
       out_length = in_data_item->length;
+      out_offset = in_data_item->offset;
       out_null_count = in_data_item->null_count;
       ++in_buffer_idx;
       AdjustInputPointer();
@@ -1176,14 +1085,15 @@ struct ViewDataImpl {
       // Copy input buffer
       const auto& in_data_item = in_data[in_layout_idx];
       out_length = in_data_item->length;
+      out_offset = in_data_item->offset;
       DCHECK_GT(in_data_item->buffers.size(), in_buffer_idx);
       out_buffers.push_back(in_data_item->buffers[in_buffer_idx]);
       ++in_buffer_idx;
       AdjustInputPointer();
     }
 
-    std::shared_ptr<ArrayData> out_data =
-        ArrayData::Make(out_type, out_length, std::move(out_buffers), out_null_count);
+    std::shared_ptr<ArrayData> out_data = ArrayData::Make(
+        out_type, out_length, std::move(out_buffers), out_null_count, out_offset);
     out_data->dictionary = dictionary;
 
     // Process children recursively, depth-first
@@ -1209,7 +1119,6 @@ Status Array::View(const std::shared_ptr<DataType>& out_type,
   impl.in_data_length = data_->length;
 
   std::shared_ptr<ArrayData> out_data;
-  RETURN_NOT_OK(impl.CheckInputAtZeroOffset());
   // Dummy field for output type
   auto out_field = field("", out_type);
   RETURN_NOT_OK(impl.MakeDataView(out_field, &out_data));
@@ -1453,11 +1362,13 @@ Status Array::Validate() const {
                            "of type ",
                            type.ToString(), ", got ", data.buffers.size());
   }
-  if (data.child_data.size() != static_cast<size_t>(type.num_children())) {
-    return Status::Invalid("Expected ", type.num_children(),
-                           " child arrays in array "
-                           "of type ",
-                           type.ToString(), ", got ", data.child_data.size());
+  if (type.id() != Type::EXTENSION) {
+    if (data.child_data.size() != static_cast<size_t>(type.num_children())) {
+      return Status::Invalid("Expected ", type.num_children(),
+                             " child arrays in array "
+                             "of type ",
+                             type.ToString(), ", got ", data.child_data.size());
+    }
   }
   if (layout.has_dictionary && !data.dictionary) {
     return Status::Invalid("Array of type ", type.ToString(),
@@ -1589,13 +1500,13 @@ class NullArrayFactory {
     int64_t length_, buffer_length_;
   };
 
-  NullArrayFactory(const std::shared_ptr<DataType>& type, int64_t length,
-                   std::shared_ptr<ArrayData>* out)
-      : type_(type), length_(length), out_(out) {}
+  NullArrayFactory(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                   int64_t length, std::shared_ptr<ArrayData>* out)
+      : pool_(pool), type_(type), length_(length), out_(out) {}
 
   Status CreateBuffer() {
     int64_t buffer_length = GetBufferLength(type_, length_);
-    RETURN_NOT_OK(AllocateBuffer(buffer_length, &buffer_));
+    RETURN_NOT_OK(AllocateBuffer(pool_, buffer_length, &buffer_));
     std::memset(buffer_->mutable_data(), 0, buffer_->size());
     return Status::OK();
   }
@@ -1661,26 +1572,133 @@ class NullArrayFactory {
   }
 
   Status CreateChild(int i, int64_t length, std::shared_ptr<ArrayData>* out) {
-    NullArrayFactory child_factory(type_->child(i)->type(), length,
+    NullArrayFactory child_factory(pool_, type_->child(i)->type(), length,
                                    &(*out_)->child_data[i]);
     child_factory.buffer_ = buffer_;
     return child_factory.Create();
   }
 
+  MemoryPool* pool_;
   std::shared_ptr<DataType> type_;
   int64_t length_;
   std::shared_ptr<ArrayData>* out_;
   std::shared_ptr<Buffer> buffer_;
 };
 
+class RepeatedArrayFactory {
+ public:
+  RepeatedArrayFactory(MemoryPool* pool, const Scalar& scalar, int64_t length,
+                       std::shared_ptr<Array>* out)
+      : pool_(pool), scalar_(scalar), length_(length), out_(out) {}
+
+  Status Create() { return VisitTypeInline(*scalar_.type, this); }
+
+  Status Visit(const NullType&) { return Status::OK(); }
+
+  Status Visit(const BooleanType&) {
+    std::shared_ptr<Buffer> buffer;
+    RETURN_NOT_OK(AllocateBitmap(pool_, length_, &buffer));
+    BitUtil::SetBitsTo(buffer->mutable_data(), 0, length_,
+                       checked_cast<const BooleanScalar&>(scalar_).value);
+    *out_ = std::make_shared<BooleanArray>(length_, buffer);
+    return Status::OK();
+  }
+
+  template <typename T>
+  enable_if_number<T, Status> Visit(const T&) {
+    auto value = checked_cast<const typename TypeTraits<T>::ScalarType&>(scalar_).value;
+    return FinishFixedWidth(&value, sizeof(value));
+  }
+
+  template <typename T>
+  enable_if_binary<T, Status> Visit(const T&) {
+    std::shared_ptr<Buffer> value =
+        checked_cast<const typename TypeTraits<T>::ScalarType&>(scalar_).value;
+    std::shared_ptr<Buffer> values_buffer, offsets_buffer;
+    RETURN_NOT_OK(CreateBufferOf(value->data(), value->size(), &values_buffer));
+    auto size = static_cast<typename T::offset_type>(value->size());
+    RETURN_NOT_OK(CreateOffsetsBuffer(size, &offsets_buffer));
+    *out_ = std::make_shared<typename TypeTraits<T>::ArrayType>(length_, offsets_buffer,
+                                                                values_buffer);
+    return Status::OK();
+  }
+
+  Status Visit(const FixedSizeBinaryType&) {
+    std::shared_ptr<Buffer> value =
+        checked_cast<const FixedSizeBinaryScalar&>(scalar_).value;
+    return FinishFixedWidth(value->data(), value->size());
+  }
+
+  Status Visit(const Decimal128Type&) {
+    auto value = checked_cast<const Decimal128Scalar&>(scalar_).value.ToBytes();
+    return FinishFixedWidth(value.data(), value.size());
+  }
+
+  Status Visit(const DataType& type) {
+    return Status::NotImplemented("construction from scalar of type ", *scalar_.type);
+  }
+
+  template <typename OffsetType>
+  Status CreateOffsetsBuffer(OffsetType value_length, std::shared_ptr<Buffer>* out) {
+    TypedBufferBuilder<OffsetType> builder(pool_);
+    RETURN_NOT_OK(builder.Resize(length_ + 1));
+    OffsetType offset = 0;
+    for (int64_t i = 0; i < length_ + 1; ++i, offset += value_length) {
+      builder.UnsafeAppend(offset);
+    }
+    return builder.Finish(out);
+  }
+
+  Status CreateBufferOf(const void* data, size_t data_length,
+                        std::shared_ptr<Buffer>* out) {
+    BufferBuilder builder(pool_);
+    RETURN_NOT_OK(builder.Resize(length_ * data_length));
+    for (int64_t i = 0; i < length_; ++i) {
+      builder.UnsafeAppend(data, data_length);
+    }
+    return builder.Finish(out);
+  }
+
+  Status FinishFixedWidth(const void* data, size_t data_length) {
+    std::shared_ptr<Buffer> buffer;
+    RETURN_NOT_OK(CreateBufferOf(data, data_length, &buffer));
+    *out_ = MakeArray(
+        ArrayData::Make(scalar_.type, length_, {nullptr, std::move(buffer)}, 0));
+    return Status::OK();
+  }
+
+  MemoryPool* pool_;
+  const Scalar& scalar_;
+  int64_t length_;
+  std::shared_ptr<Array>* out_;
+};
+
 }  // namespace internal
+
+Status MakeArrayOfNull(MemoryPool* pool, const std::shared_ptr<DataType>& type,
+                       int64_t length, std::shared_ptr<Array>* out) {
+  std::shared_ptr<ArrayData> out_data;
+  RETURN_NOT_OK(internal::NullArrayFactory(pool, type, length, &out_data).Create());
+  *out = MakeArray(out_data);
+  return Status::OK();
+}
 
 Status MakeArrayOfNull(const std::shared_ptr<DataType>& type, int64_t length,
                        std::shared_ptr<Array>* out) {
-  std::shared_ptr<ArrayData> out_data;
-  RETURN_NOT_OK(internal::NullArrayFactory(type, length, &out_data).Create());
-  *out = MakeArray(out_data);
-  return Status::OK();
+  return MakeArrayOfNull(default_memory_pool(), type, length, out);
+}
+
+Status MakeArrayFromScalar(MemoryPool* pool, const Scalar& scalar, int64_t length,
+                           std::shared_ptr<Array>* out) {
+  if (!scalar.is_valid) {
+    return MakeArrayOfNull(pool, scalar.type, length, out);
+  }
+  return internal::RepeatedArrayFactory(pool, scalar, length, out).Create();
+}
+
+Status MakeArrayFromScalar(const Scalar& scalar, int64_t length,
+                           std::shared_ptr<Array>* out) {
+  return MakeArrayFromScalar(default_memory_pool(), scalar, length, out);
 }
 
 namespace internal {

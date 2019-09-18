@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <sstream>
 #include <utility>
@@ -35,6 +36,7 @@
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/RetryStrategy.h>
 #include <aws/core/utils/logging/ConsoleLogSystem.h>
 #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
@@ -63,6 +65,7 @@
 #include "arrow/filesystem/s3_internal.h"
 #include "arrow/io/interfaces.h"
 #include "arrow/io/memory.h"
+#include "arrow/io/util_internal.h"
 #include "arrow/util/logging.h"
 
 namespace arrow {
@@ -128,6 +131,30 @@ Status FinalizeS3() {
   Aws::ShutdownAPI(aws_options);
   aws_initialized.store(false);
   return Status::OK();
+}
+
+void S3Options::ConfigureDefaultCredentials() {
+  credentials_provider =
+      std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
+}
+
+void S3Options::ConfigureAccessKey(const std::string& access_key,
+                                   const std::string& secret_key) {
+  credentials_provider = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(
+      ToAwsString(access_key), ToAwsString(secret_key));
+}
+
+S3Options S3Options::Defaults() {
+  S3Options options;
+  options.ConfigureDefaultCredentials();
+  return options;
+}
+
+S3Options S3Options::FromAccessKey(const std::string& access_key,
+                                   const std::string& secret_key) {
+  S3Options options;
+  options.ConfigureAccessKey(access_key, secret_key);
+  return options;
 }
 
 namespace {
@@ -249,7 +276,10 @@ class ObjectInputFile : public io::RandomAccessFile {
       if (IsNotFound(outcome.GetError())) {
         return PathNotFound(path_);
       } else {
-        return ErrorToStatus(outcome.GetError());
+        return ErrorToStatus(
+            std::forward_as_tuple("When reading information for key '", path_.key,
+                                  "' in bucket '", path_.bucket, "': "),
+            outcome.GetError());
       }
     }
     content_length_ = outcome.GetResult().GetContentLength();
@@ -382,17 +412,18 @@ static constexpr int64_t kMinimumPartUpload = 5 * 1024 * 1024;
 
 // An OutputStream that writes to a S3 object
 class ObjectOutputStream : public io::OutputStream {
+ protected:
+  struct UploadState;
+
  public:
-  ObjectOutputStream(Aws::S3::S3Client* client, const S3Path& path)
-      : client_(client), path_(path) {}
+  ObjectOutputStream(Aws::S3::S3Client* client, const S3Path& path,
+                     const S3Options& options)
+      : client_(client), path_(path), options_(options) {}
 
   ~ObjectOutputStream() override {
-    if (!closed_) {
-      auto st = Abort();
-      if (!st.ok()) {
-        ARROW_LOG(ERROR) << "Could not abort multipart upload: " << st;
-      }
-    }
+    // For compliance with the rest of the IO stack, Close rather than Abort,
+    // even though it may be more expensive.
+    io::internal::CloseFromDestructor(this);
   }
 
   Status Init() {
@@ -403,14 +434,22 @@ class ObjectOutputStream : public io::OutputStream {
 
     auto outcome = client_->CreateMultipartUpload(req);
     if (!outcome.IsSuccess()) {
-      return ErrorToStatus(outcome.GetError());
+      return ErrorToStatus(
+          std::forward_as_tuple("When initiating multiple part upload for key '",
+                                path_.key, "' in bucket '", path_.bucket, "': "),
+          outcome.GetError());
     }
     upload_id_ = outcome.GetResult().GetUploadId();
+    upload_state_ = std::make_shared<UploadState>();
     closed_ = false;
     return Status::OK();
   }
 
-  Status Abort() {
+  Status Abort() override {
+    if (closed_) {
+      return Status::OK();
+    }
+
     S3Model::AbortMultipartUploadRequest req;
     req.SetBucket(ToAwsString(path_.bucket));
     req.SetKey(ToAwsString(path_.key));
@@ -418,7 +457,10 @@ class ObjectOutputStream : public io::OutputStream {
 
     auto outcome = client_->AbortMultipartUpload(req);
     if (!outcome.IsSuccess()) {
-      return ErrorToStatus(outcome.GetError());
+      return ErrorToStatus(
+          std::forward_as_tuple("When aborting multiple part upload for key '", path_.key,
+                                "' in bucket '", path_.bucket, "': "),
+          outcome.GetError());
     }
     current_part_.reset();
     closed_ = true;
@@ -438,20 +480,32 @@ class ObjectOutputStream : public io::OutputStream {
     }
 
     // S3 mandates at least one part, upload an empty one if necessary
-    if (completed_upload_.GetParts().empty()) {
+    if (part_number_ == 1) {
       RETURN_NOT_OK(UploadPart("", 0));
     }
-    DCHECK(completed_upload_.PartsHasBeenSet());
 
+    // Wait for in-progress uploads to finish (if async writes are enabled)
+    RETURN_NOT_OK(Flush());
+
+    // At this point, all part uploads have finished successfully
+    DCHECK_GT(part_number_, 1);
+    DCHECK_EQ(upload_state_->completed_parts.size(),
+              static_cast<size_t>(part_number_ - 1));
+
+    S3Model::CompletedMultipartUpload completed_upload;
+    completed_upload.SetParts(upload_state_->completed_parts);
     S3Model::CompleteMultipartUploadRequest req;
     req.SetBucket(ToAwsString(path_.bucket));
     req.SetKey(ToAwsString(path_.key));
     req.SetUploadId(upload_id_);
-    req.SetMultipartUpload(completed_upload_);
+    req.SetMultipartUpload(std::move(completed_upload));
 
     auto outcome = client_->CompleteMultipartUpload(req);
     if (!outcome.IsSuccess()) {
-      return ErrorToStatus(outcome.GetError());
+      return ErrorToStatus(
+          std::forward_as_tuple("When completing multiple part upload for key '",
+                                path_.key, "' in bucket '", path_.bucket, "': "),
+          outcome.GetError());
     }
 
     closed_ = true;
@@ -516,51 +570,130 @@ class ObjectOutputStream : public io::OutputStream {
     if (closed_) {
       return Status::Invalid("Operation on closed stream");
     }
-    return Status::OK();
+    // Wait for background writes to finish
+    std::unique_lock<std::mutex> lock(upload_state_->mutex);
+    upload_state_->cv.wait(lock,
+                           [this]() { return upload_state_->parts_in_progress == 0; });
+    return upload_state_->status;
   }
+
+  // Upload-related helpers
 
   Status CommitCurrentPart() {
     std::shared_ptr<Buffer> buf;
     RETURN_NOT_OK(current_part_->Finish(&buf));
     current_part_.reset();
     current_part_size_ = 0;
-    return UploadPart(buf->data(), buf->size());
+    return UploadPart(std::move(buf));
   }
 
-  Status UploadPart(const void* data, int64_t nbytes) {
+  Status UploadPart(std::shared_ptr<Buffer> buffer) {
+    return UploadPart(buffer->data(), buffer->size(), buffer);
+  }
+
+  Status UploadPart(const void* data, int64_t nbytes,
+                    std::shared_ptr<Buffer> owned_buffer = nullptr) {
     S3Model::UploadPartRequest req;
     req.SetBucket(ToAwsString(path_.bucket));
     req.SetKey(ToAwsString(path_.key));
     req.SetUploadId(upload_id_);
     req.SetPartNumber(part_number_);
     req.SetContentLength(nbytes);
-    req.SetBody(std::make_shared<StringViewStream>(data, nbytes));
 
-    auto outcome = client_->UploadPart(req);
-    if (!outcome.IsSuccess()) {
-      return ErrorToStatus(outcome.GetError());
+    if (!options_.background_writes) {
+      req.SetBody(std::make_shared<StringViewStream>(data, nbytes));
+      auto outcome = client_->UploadPart(req);
+      if (!outcome.IsSuccess()) {
+        return UploadPartError(req, outcome);
+      } else {
+        AddCompletedPart(upload_state_, part_number_, outcome.GetResult());
+      }
+    } else {
+      std::unique_lock<std::mutex> lock(upload_state_->mutex);
+      auto state = upload_state_;  // Keep upload state alive in closure
+      auto part_number = part_number_;
+
+      // If the data isn't owned, make an immutable copy for the lifetime of the closure
+      if (owned_buffer == nullptr) {
+        RETURN_NOT_OK(AllocateBuffer(nbytes, &owned_buffer));
+        memcpy(owned_buffer->mutable_data(), data, nbytes);
+      } else {
+        DCHECK_EQ(data, owned_buffer->data());
+        DCHECK_EQ(nbytes, owned_buffer->size());
+      }
+      req.SetBody(
+          std::make_shared<StringViewStream>(owned_buffer->data(), owned_buffer->size()));
+
+      auto handler =
+          [state, owned_buffer, part_number](
+              const Aws::S3::S3Client*, const S3Model::UploadPartRequest& req,
+              const S3Model::UploadPartOutcome& outcome,
+              const std::shared_ptr<const Aws::Client::AsyncCallerContext>&) -> void {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        if (!outcome.IsSuccess()) {
+          state->status &= UploadPartError(req, outcome);
+        } else {
+          AddCompletedPart(state, part_number, outcome.GetResult());
+        }
+        // Notify completion, regardless of success / error status
+        if (--state->parts_in_progress == 0) {
+          state->cv.notify_all();
+        }
+      };
+      ++upload_state_->parts_in_progress;
+      client_->UploadPartAsync(req, handler);
     }
-    // Append ETag and part number for this uploaded part
-    // (will be needed for upload completion in Close())
-    S3Model::CompletedPart part;
-    part.SetPartNumber(part_number_);
-    part.SetETag(outcome.GetResult().GetETag());
-    completed_upload_.AddParts(std::move(part));
     ++part_number_;
     return Status::OK();
+  }
+
+  static void AddCompletedPart(const std::shared_ptr<UploadState>& state, int part_number,
+                               const S3Model::UploadPartResult& result) {
+    S3Model::CompletedPart part;
+    // Append ETag and part number for this uploaded part
+    // (will be needed for upload completion in Close())
+    part.SetPartNumber(part_number);
+    part.SetETag(result.GetETag());
+    int slot = part_number - 1;
+    if (state->completed_parts.size() <= static_cast<size_t>(slot)) {
+      state->completed_parts.resize(slot + 1);
+    }
+    DCHECK(!state->completed_parts[slot].PartNumberHasBeenSet());
+    state->completed_parts[slot] = std::move(part);
+  }
+
+  static Status UploadPartError(const S3Model::UploadPartRequest& req,
+                                const S3Model::UploadPartOutcome& outcome) {
+    return ErrorToStatus(
+        std::forward_as_tuple("When uploading part for key '", req.GetKey(),
+                              "' in bucket '", req.GetBucket(), "': "),
+        outcome.GetError());
   }
 
  protected:
   Aws::S3::S3Client* client_;
   S3Path path_;
+  const S3Options& options_;
   Aws::String upload_id_;
-  S3Model::CompletedMultipartUpload completed_upload_;
   bool closed_ = true;
   int64_t pos_ = 0;
   int32_t part_number_ = 1;
   std::shared_ptr<io::BufferOutputStream> current_part_;
   int64_t current_part_size_ = 0;
   int64_t part_upload_threshold_ = kMinimumPartUpload;
+
+  // This struct is kept alive through background writes to avoid problems
+  // in the completion handler.
+  struct UploadState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    Aws::Vector<S3Model::CompletedPart> completed_parts;
+    int64_t parts_in_progress = 0;
+    Status status;
+
+    UploadState() : status(Status::OK()) {}
+  };
+  std::shared_ptr<UploadState> upload_state_;
 };
 
 // This function assumes st->path() is already set
@@ -596,7 +729,7 @@ class S3FileSystem::Impl {
   explicit Impl(S3Options options) : options_(std::move(options)) {}
 
   Status Init() {
-    credentials_ = {ToAwsString(options_.access_key), ToAwsString(options_.secret_key)};
+    credentials_ = options_.credentials_provider->GetAWSCredentials();
     client_config_.region = ToAwsString(options_.region);
     client_config_.endpointOverride = ToAwsString(options_.endpoint_override);
     if (options_.scheme == "http") {
@@ -627,7 +760,8 @@ class S3FileSystem::Impl {
 
     auto outcome = client_->CreateBucket(req);
     if (!outcome.IsSuccess() && !IsAlreadyExists(outcome.GetError())) {
-      return ErrorToStatus(outcome.GetError());
+      return ErrorToStatus(std::forward_as_tuple("When creating bucket '", bucket, "': "),
+                           outcome.GetError());
     }
     return Status::OK();
   }
@@ -637,7 +771,9 @@ class S3FileSystem::Impl {
     S3Model::PutObjectRequest req;
     req.SetBucket(ToAwsString(bucket));
     req.SetKey(ToAwsString(key));
-    return OutcomeToStatus(client_->PutObject(req));
+    return OutcomeToStatus(
+        std::forward_as_tuple("When creating key '", key, "' in bucket '", bucket, "': "),
+        client_->PutObject(req));
   }
 
   Status CreateEmptyDir(const std::string& bucket, const std::string& key) {
@@ -649,7 +785,9 @@ class S3FileSystem::Impl {
     S3Model::DeleteObjectRequest req;
     req.SetBucket(ToAwsString(bucket));
     req.SetKey(ToAwsString(key));
-    return OutcomeToStatus(client_->DeleteObject(req));
+    return OutcomeToStatus(
+        std::forward_as_tuple("When delete key '", key, "' in bucket '", bucket, "': "),
+        client_->DeleteObject(req));
   }
 
   Status CopyObject(const S3Path& src_path, const S3Path& dest_path) {
@@ -658,7 +796,11 @@ class S3FileSystem::Impl {
     req.SetKey(ToAwsString(dest_path.key));
     // Copy source "Must be URL-encoded" according to AWS SDK docs.
     req.SetCopySource(src_path.ToURLEncodedAwsString());
-    return OutcomeToStatus(client_->CopyObject(req));
+    return OutcomeToStatus(
+        std::forward_as_tuple("When copying key '", src_path.key, "' in bucket '",
+                              src_path.bucket, "' to key '", dest_path.key,
+                              "' in bucket '", dest_path.bucket, "': "),
+        client_->CopyObject(req));
   }
 
   // On Minio, an empty "directory" doesn't satisfy the same API requests as
@@ -679,7 +821,9 @@ class S3FileSystem::Impl {
       *out = false;
       return Status::OK();
     }
-    return ErrorToStatus(outcome.GetError());
+    return ErrorToStatus(std::forward_as_tuple("When reading information for key '", key,
+                                               "' in bucket '", bucket, "': "),
+                         outcome.GetError());
   }
 
   Status IsEmptyDirectory(const S3Path& path, bool* out) {
@@ -701,7 +845,10 @@ class S3FileSystem::Impl {
       *out = false;
       return Status::OK();
     }
-    return ErrorToStatus(outcome.GetError());
+    return ErrorToStatus(
+        std::forward_as_tuple("When listing objects under key '", path.key,
+                              "' in bucket '", path.bucket, "': "),
+        outcome.GetError());
   }
 
   // List objects under a given prefix, issuing continuation requests if necessary
@@ -789,7 +936,9 @@ class S3FileSystem::Impl {
       if (select.allow_non_existent && IsNotFound(error)) {
         return Status::OK();
       }
-      return ErrorToStatus(error);
+      return ErrorToStatus(std::forward_as_tuple("When listing objects under key '", key,
+                                                 "' in bucket '", bucket, "': "),
+                           error);
     };
 
     RETURN_NOT_OK(
@@ -843,7 +992,9 @@ class S3FileSystem::Impl {
     };
 
     auto handle_error = [&](const AWSError<S3Errors>& error) -> Status {
-      return ErrorToStatus(error);
+      return ErrorToStatus(std::forward_as_tuple("When listing objects under key '", key,
+                                                 "' in bucket '", bucket, "': "),
+                           error);
     };
 
     RETURN_NOT_OK(
@@ -925,7 +1076,8 @@ class S3FileSystem::Impl {
     out->clear();
     auto outcome = client_->ListBuckets();
     if (!outcome.IsSuccess()) {
-      return ErrorToStatus(outcome.GetError());
+      return ErrorToStatus(std::forward_as_tuple("When listing buckets: "),
+                           outcome.GetError());
     }
     for (const auto& bucket : outcome.GetResult().GetBuckets()) {
       out->emplace_back(FromAwsString(bucket.GetName()));
@@ -966,7 +1118,10 @@ Status S3FileSystem::GetTargetStats(const std::string& s, FileStats* out) {
     auto outcome = impl_->client_->HeadBucket(req);
     if (!outcome.IsSuccess()) {
       if (!IsNotFound(outcome.GetError())) {
-        return ErrorToStatus(outcome.GetError());
+        return ErrorToStatus(
+            std::forward_as_tuple("When getting information for bucket '", path.bucket,
+                                  "': "),
+            outcome.GetError());
       }
       st.set_type(FileType::NonExistent);
       *out = st;
@@ -990,7 +1145,10 @@ Status S3FileSystem::GetTargetStats(const std::string& s, FileStats* out) {
       return FileObjectToStats(outcome.GetResult(), out);
     }
     if (!IsNotFound(outcome.GetError())) {
-      return ErrorToStatus(outcome.GetError());
+      return ErrorToStatus(
+          std::forward_as_tuple("When getting information for key '", path.key,
+                                "' in bucket '", path.bucket, "': "),
+          outcome.GetError());
     }
     // Not found => perhaps it's an empty "directory"
     bool is_dir = false;
@@ -1091,7 +1249,9 @@ Status S3FileSystem::DeleteDir(const std::string& s) {
     // Delete bucket
     S3Model::DeleteBucketRequest req;
     req.SetBucket(ToAwsString(path.bucket));
-    return OutcomeToStatus(impl_->client_->DeleteBucket(req));
+    return OutcomeToStatus(
+        std::forward_as_tuple("When deleting bucket '", path.bucket, "': "),
+        impl_->client_->DeleteBucket(req));
   } else {
     // Delete "directory"
     RETURN_NOT_OK(impl_->DeleteObject(path.bucket, path.key + kSep));
@@ -1127,7 +1287,10 @@ Status S3FileSystem::DeleteFile(const std::string& s) {
     if (IsNotFound(outcome.GetError())) {
       return PathNotFound(path);
     } else {
-      return ErrorToStatus(outcome.GetError());
+      return ErrorToStatus(
+          std::forward_as_tuple("When getting information for key '", path.key,
+                                "' in bucket '", path.bucket, "': "),
+          outcome.GetError());
     }
   }
   // Object found, delete it
@@ -1199,7 +1362,8 @@ Status S3FileSystem::OpenOutputStream(const std::string& s,
   RETURN_NOT_OK(S3Path::FromString(s, &path));
   RETURN_NOT_OK(ValidateFilePath(path));
 
-  auto ptr = std::make_shared<ObjectOutputStream>(impl_->client_.get(), path);
+  auto ptr =
+      std::make_shared<ObjectOutputStream>(impl_->client_.get(), path, impl_->options_);
   RETURN_NOT_OK(ptr->Init());
   *out = std::move(ptr);
   return Status::OK();
